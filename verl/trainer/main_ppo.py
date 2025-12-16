@@ -315,12 +315,22 @@ class TaskRunner:
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # Load the reward manager for training and validation.
+        # Load the reward manager for training
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
+
+        # Create a separate configuration for validation
+        val_config = config.copy()
+
+        # Check if a specific validation reward function is defined in the config
+        # We look for a new key 'val_custom_reward_function' and overwrite the default one
+        if config.get("val_custom_reward_function"):
+            val_config.custom_reward_function = config.val_custom_reward_function
+
+        # Load the validation reward manager using the modified config
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            val_config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
