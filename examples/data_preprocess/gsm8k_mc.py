@@ -131,7 +131,6 @@ if __name__ == "__main__":
     
     train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_save_dir, "test.parquet"))
-
     if hdfs_dir is not None:
         # Assuming hdfs_io is correctly imported or defined
         # makedirs(hdfs_dir)
