@@ -40,7 +40,6 @@ def extract_choice(solution_str):
         # If the required format '#### X' is not found, return None
         return None
 
-
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """The scoring function for GSM-MC-Stage.
 
@@ -52,15 +51,20 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """
     # 1. Extract the model's final answer (the choice letter)
     model_choice = extract_choice(solution_str=solution_str)
+    format_ok = model_choice is not None
 
-    if model_choice is None:
+    if not format_ok:
         # The model failed to follow the required format (#### A/B/C/D)
-        return 0.0
-    else:
-        # 2. Compare the extracted choice with the ground truth
-        if model_choice.strip() == ground_truth.strip():
-            # Correct answer (and correct format due to extraction success)
-            return 1.0
-        else:
-            # Incorrect answer (but correct format since extraction succeeded)
-            return 0.0
+        return {
+            "score": 0.0,
+            "format_ok": False,
+            "pred": "",
+        }
+
+    # 2. Compare the extracted choice with the ground truth
+    is_correct = model_choice.strip() == ground_truth.strip()
+    return {
+        "score": 1.0 if is_correct else 0.0,
+        "format_ok": True,
+        "pred": model_choice,
+    }

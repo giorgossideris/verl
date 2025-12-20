@@ -128,7 +128,7 @@ if __name__ == "__main__":
 
     # Use the new local save directory from the arguments default
     os.makedirs(local_save_dir, exist_ok=True)
-    
+
     train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_save_dir, "test.parquet"))
     if hdfs_dir is not None:
