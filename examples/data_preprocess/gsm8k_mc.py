@@ -38,6 +38,13 @@ DEFAULT_AUG_SAVE_DIR = "~/data/gsm_mc_stage_aug"
 BASE_OPTION_LABELS = ["A", "B", "C", "D"]
 ALL_OPTION_LABELS = list(string.ascii_uppercase)
 
+def extract_solution(solution_str: str) -> str:
+    solution = re.search(r"#### (\-?[0-9\.\,]+)", solution_str)
+    if solution is None:
+        raise ValueError("Unable to extract final solution from GSM8K answer.")
+    final_solution = solution.group(1).replace(",", "")
+    return final_solution
+
 # --- Custom Multiple-Choice Prompt Formatting ---
 def format_multiple_choice_prompt(question_raw, example, include_cot_phrase: bool):
     """
@@ -102,6 +109,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Remove the \"Let's think step by step\" phrase from the prompt suffix.",
     )
+    parser.add_argument(
+        "--open_ended_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of GSM8K (open-ended) examples to sample and append per split. "
+        "0.01 means floor(len(split) * 0.01) samples.",
+    )
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
@@ -132,6 +146,13 @@ if __name__ == "__main__":
         parent, base = os.path.split(expanded)
         base = base or os.path.basename(os.path.normpath(expanded))
         return os.path.join(parent, f"opt{num_options}x_{base}")
+
+    def openended_prefixed_dir(path: str, fraction: float) -> str:
+        expanded = os.path.expanduser(path)
+        parent, base = os.path.split(expanded)
+        base = base or os.path.basename(os.path.normpath(expanded))
+        frac_tag = str(fraction).replace(".", "p")
+        return os.path.join(parent, f"open{frac_tag}x_{base}")
 
     if args.augment:
         if legacy_local_dir is not None:
@@ -164,6 +185,15 @@ if __name__ == "__main__":
         # Avoid overwriting defaults when adjusting options
         local_save_dir = option_prefixed_dir(local_save_dir, args.num_options)
 
+    if (
+        args.open_ended_fraction > 0
+        and legacy_local_dir is None
+        and not local_save_dir_provided
+        and not augment_save_dir_provided
+    ):
+        # Avoid overwriting defaults when adding open-ended samples
+        local_save_dir = openended_prefixed_dir(local_save_dir, args.open_ended_fraction)
+
     val_data_source = os.path.basename(os.path.normpath(os.path.expanduser(local_save_dir)))
 
     if local_dataset_path is not None:
@@ -180,11 +210,14 @@ if __name__ == "__main__":
     # instruction_following = 'Let\'s think step by step and output the final answer after "####".'
 
     rng = random.Random(args.augment_seed)
+    sample_rng = random.Random(args.augment_seed + 1)
     option_labels = BASE_OPTION_LABELS
 
     if args.num_options is not None:
         if args.num_options < 1 or args.num_options > len(ALL_OPTION_LABELS):
             raise ValueError(f"--num_options must be between 1 and {len(ALL_OPTION_LABELS)}; got {args.num_options}")
+    if args.open_ended_fraction < 0 or args.open_ended_fraction > 1:
+        raise ValueError("--open_ended_fraction must be between 0 and 1.")
 
     def swap_correct_option(options: dict, correct_letter: str, swap_with: str):
         """Return new options dict and new correct letter after swap."""
@@ -380,11 +413,54 @@ if __name__ == "__main__":
             variants.append(data)
         return variants
 
+    def format_open_ended_prompt(question_raw: str, include_cot_phrase: bool):
+        suffix = 'output the final answer after "####".'
+        if include_cot_phrase:
+            suffix = f"Let's think step by step and {suffix}"
+        return f"{question_raw} {suffix}"
+
+    def generate_open_ended_records(dataset_split, split_name: str, index_offset: int):
+        total = len(dataset_split)
+        sample_size = int(total * args.open_ended_fraction)
+        if sample_size == 0:
+            return []
+        indices = sample_rng.sample(range(total), sample_size)
+        records = []
+        for local_idx, ds_idx in enumerate(indices):
+            ex = dataset_split[ds_idx]
+            question_raw = ex["question"]
+            answer_raw = ex["answer"]
+            solution = extract_solution(answer_raw)
+            question = format_open_ended_prompt(question_raw, include_cot_phrase=not args.no_cot_phrase)
+            records.append(
+                {
+                    "data_source": "openai/gsm8k",
+                    "prompt": [{"role": "user", "content": question}],
+                    "ability": "math",
+                    "reward_model": {"style": "rule", "ground_truth": solution},
+                    "extra_info": {
+                        "split": split_name,
+                        "index": index_offset + local_idx,
+                        "orig_index": ds_idx,
+                        "question": question_raw,
+                        "answer": answer_raw,
+                        "open_ended": True,
+                    },
+                }
+            )
+        return records
+
     def preprocess_split(dataset_split, split_name: str, data_source_name: str):
         records = []
         for idx, ex in enumerate(dataset_split):
             records.extend(generate_variants(ex, split_name, idx, data_source_name))
+        if args.open_ended_fraction > 0:
+            records.extend(generate_open_ended_records(gsm8k_dataset[split_name], split_name, len(records)))
         return datasets.Dataset.from_list(records)
+
+    gsm8k_dataset = None
+    if args.open_ended_fraction > 0:
+        gsm8k_dataset = datasets.load_dataset("openai/gsm8k", "main")
 
     # Build augmented (or original) datasets with optional duplication
     train_dataset = preprocess_split(train_dataset, "train", data_source)
