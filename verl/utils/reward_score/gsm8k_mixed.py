@@ -22,7 +22,13 @@ from verl.utils.reward_score import gsm8k_mc
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """Dispatch to GSM8K or GSM8K-MC scoring based on data_source."""
     if data_source == "openai/gsm8k":
-        return gsm8k.compute_score(solution_str, ground_truth)
+        pred = gsm8k.extract_solution(solution_str=solution_str, method="strict")
+        score = gsm8k.compute_score(solution_str, ground_truth)
+        return {
+            "score": score,
+            "format_ok": pred is not None,
+            "pred": pred if pred is not None else "",
+        }
     if data_source in ["satoshidg/GSM-MC-Stage", "gsm8k_mc"]:
         return gsm8k_mc.compute_score(data_source, solution_str, ground_truth, extra_info)
     raise NotImplementedError(f"Reward function is not implemented for {data_source=}")

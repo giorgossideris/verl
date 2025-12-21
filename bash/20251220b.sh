@@ -2,12 +2,14 @@ gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 gsm8k_train_path_mc=$HOME/data/gsm8k_mc/train.parquet
 gsm8k_test_path_mc=$HOME/data/gsm8k_mc/test.parquet
+gsm8k_train_path_mc_aug2x=/local/home/tommaben/data/aug2x_gsm_mc_stage_aug/train.parquet
+gsm8k_train_path_mc_opt2x=/local/home/tommaben/data/opt2x_gsm_mc_stage/train.parquet
 GPUS=${GPUS:-8}
 
 
 VLLM_USE_FLASHINFER_SAMPLER=1 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$gsm8k_train_path_mc \
+    data.train_files=$gsm8k_train_path_mc_aug2x \
     data.val_files="[$gsm8k_test_path_mc,$gsm8k_test_path]" \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
@@ -30,16 +32,16 @@ VLLM_USE_FLASHINFER_SAMPLER=1 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_pp
     trainer.test_freq=1 \
     trainer.logger='["console","wandb"]' \
     actor_rollout_ref.actor.checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
-    trainer.total_epochs=15 \
+    trainer.total_epochs=5 \
     trainer.project_name='multiple_choice_question_study' \
-    trainer.experiment_name='qwen25_3B_mc_gsm8k' \
+    trainer.experiment_name='qwen25_3B_mc_aug2x_gsm8k' \
     custom_reward_function.path=verl/utils/reward_score/gsm8k_mixed.py \
     custom_reward_function.name=compute_score \
-    2>&1 | tee verl_mc_demo.log
+    2>&1 | tee verl_demo.log
 
 VLLM_USE_FLASHINFER_SAMPLER=1 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$gsm8k_train_path \
+    data.train_files=$gsm8k_train_path_mc_opt2x \
     data.val_files="[$gsm8k_test_path_mc,$gsm8k_test_path]" \
     data.train_batch_size=1024 \
     data.max_prompt_length=512 \
@@ -62,9 +64,9 @@ VLLM_USE_FLASHINFER_SAMPLER=1 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_pp
     trainer.test_freq=1 \
     trainer.logger='["console","wandb"]' \
     actor_rollout_ref.actor.checkpoint.save_contents='["model","optimizer","extra","hf_model"]' \
-    trainer.total_epochs=15 \
+    trainer.total_epochs=5 \
     trainer.project_name='multiple_choice_question_study' \
-    trainer.experiment_name='qwen25_3B_gsm8k' \
+    trainer.experiment_name='qwen25_3B_mc_opt2x_gsm8k' \
     custom_reward_function.path=verl/utils/reward_score/gsm8k_mixed.py \
     custom_reward_function.name=compute_score \
     2>&1 | tee verl_demo.log
