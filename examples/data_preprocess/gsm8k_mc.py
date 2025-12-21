@@ -28,18 +28,23 @@ The swaps update both the displayed options and the ground-truth letter.
 import argparse
 import os
 import random
+import re
+import string
 import datasets
 
 DEFAULT_SAVE_DIR = "~/data/gsm_mc_stage"
 DEFAULT_AUG_SAVE_DIR = "~/data/gsm_mc_stage_aug"
 
+BASE_OPTION_LABELS = ["A", "B", "C", "D"]
+ALL_OPTION_LABELS = list(string.ascii_uppercase)
+
 # --- Custom Multiple-Choice Prompt Formatting ---
 def format_multiple_choice_prompt(question_raw, example, include_cot_phrase: bool):
     """
-    Constructs a single prompt string including the question and all options (A, B, C, D).
+    Constructs a single prompt string including the question and all options (A, B, C, D, ...).
     """
     options = []
-    for label in ["A", "B", "C", "D"]:
+    for label in ALL_OPTION_LABELS:
         if label in example:
             options.append(f"{label}: {example[label]}")
     
@@ -89,8 +94,8 @@ if __name__ == "__main__":
         "--num_options",
         type=int,
         default=None,
-        help="Reduce the number of options to this value (e.g., 2 or 3). Must be "
-        "at least 1 and less than the total options; otherwise an error is raised.",
+        help="Adjust the number of options. Use a smaller value (e.g., 2 or 3) to reduce "
+        "choices or a larger value to add numeric distractors. Must be between 1 and 26.",
     )
     parser.add_argument(
         "--no_cot_phrase",
@@ -102,139 +107,9 @@ if __name__ == "__main__":
     local_dataset_path = args.local_dataset_path
 
     # Update data source to the multiple-choice version
-    data_source = "satoshidg/GSM-MC-Stage" 
+    data_source = "satoshidg/GSM-MC-Stage"
 
-    if local_dataset_path is not None:
-        # Note: The GSM-MC-Stage dataset only has 'train' and 'test' splits
-        dataset = datasets.load_dataset(local_dataset_path, "default")
-    else:
-        # Load from Hugging Face Hub
-        dataset = datasets.load_dataset(data_source, "default")
-
-    train_dataset = dataset["train"]
-    test_dataset = dataset["test"]
-
-    # The instruction is now part of the prompt construction function (format_multiple_choice_prompt)
-    # instruction_following = 'Let\'s think step by step and output the final answer after "####".'
-
-    rng = random.Random(args.augment_seed)
-    option_labels = ["A", "B", "C", "D"]
-
-    if args.num_options is not None:
-        if args.num_options < 1 or args.num_options >= len(option_labels):
-            raise ValueError(
-                f"--num_options must be >=1 and < {len(option_labels)}; got {args.num_options}"
-            )
-
-    def swap_correct_option(options: dict, correct_letter: str, swap_with: str):
-        """Return new options dict and new correct letter after swap."""
-        swapped = dict(options)
-        swapped[correct_letter], swapped[swap_with] = swapped[swap_with], swapped[correct_letter]
-        return swapped, swap_with
-
-    def reduce_options(options: dict, correct_letter: str):
-        """Return reduced options and new correct letter after re-labeling."""
-        if args.num_options is None:
-            return options, correct_letter, None
-
-        total_options = len(options)
-        if args.num_options >= total_options:
-            raise ValueError(
-                f"--num_options must be < total options ({total_options}); got {args.num_options}"
-            )
-        if args.num_options < 1:
-            raise ValueError("--num_options must be at least 1.")
-
-        other_letters = [l for l in options if l != correct_letter]
-        keep_others = rng.sample(other_letters, args.num_options - 1)
-        selected = [correct_letter] + keep_others
-        selected_ordered = [l for l in option_labels if l in selected]
-
-        new_labels = option_labels[: len(selected_ordered)]
-        remap = dict(zip(selected_ordered, new_labels))
-        reduced = {remap[old]: options[old] for old in selected_ordered}
-        new_correct = remap[correct_letter]
-        return reduced, new_correct, remap
-
-    def generate_variants(example: dict, split: str, orig_idx: int):
-        """Create one or more variants (augmented) for a single example."""
-        # Copy raw fields so we don't mutate HF dataset internals
-        question_raw = example["Question"]
-        correct_letter = example["Answer"]
-        options = {label: example[label] for label in option_labels}
-
-        if not args.augment:
-            swap_plan = [(correct_letter, None)]  # (new_correct, swap_info)
-        else:
-            times = max(1, args.augment_times)
-            other_letters = [l for l in option_labels if l != correct_letter]
-            rng.shuffle(other_letters)
-            swap_targets = []
-            # Use distinct targets when possible, then sample with replacement
-            for _ in range(times):
-                if other_letters:
-                    swap_targets.append(other_letters.pop())
-                else:
-                    swap_targets.append(rng.choice([l for l in option_labels if l != correct_letter]))
-            swap_plan = []
-            for target in swap_targets:
-                swap_plan.append((target, {"from": correct_letter, "to": target}))
-
-        variants = []
-        for variant_id, (new_correct, swap_info) in enumerate(swap_plan):
-            variant_options = dict(options)
-            if args.augment:
-                variant_options, new_correct = swap_correct_option(variant_options, correct_letter, new_correct)
-
-            # Option reduction (keep only num_options if requested)
-            variant_options, new_correct, remap = reduce_options(variant_options, new_correct)
-
-            question = format_multiple_choice_prompt(
-                question_raw,
-                variant_options,
-                include_cot_phrase=not args.no_cot_phrase,
-            )
-            data = {
-                "data_source": data_source,
-                "prompt": [
-                    {
-                        "role": "user",
-                        "content": question,
-                    }
-                ],
-                "ability": "math_mc", # Updated ability type
-                "reward_model": {"style": "rule", "ground_truth": new_correct},
-                "extra_info": {
-                    "split": split,
-                    # Ensure unique indices across variants to keep replay/resume simple
-                    "index": orig_idx * len(swap_plan) + variant_id,
-                    "orig_index": orig_idx,
-                    "augment_variant": variant_id if args.augment else None,
-                    "correct_choice": new_correct,
-                    "question_raw": question_raw,
-                    "A": variant_options.get("A"),
-                    "B": variant_options.get("B"),
-                    "C": variant_options.get("C"),
-                    "D": variant_options.get("D"),
-                    "augment_swap": swap_info,
-                    "option_remap": remap,
-                    "num_options": args.num_options,
-                },
-            }
-            variants.append(data)
-        return variants
-
-    def preprocess_split(dataset_split, split_name: str):
-        records = []
-        for idx, ex in enumerate(dataset_split):
-            records.extend(generate_variants(ex, split_name, idx))
-        return datasets.Dataset.from_list(records)
-
-    # Build augmented (or original) datasets with optional duplication
-    train_dataset = preprocess_split(train_dataset, "train")
-    test_dataset = preprocess_split(test_dataset, "test")
-
-    # --- Saving Logic ---
+    # --- Saving Logic (used to derive validation data_source) ---
     hdfs_dir = args.hdfs_dir
     legacy_local_dir = args.local_dir
     augment_save_dir_provided = args.augment_save_dir != DEFAULT_AUG_SAVE_DIR
@@ -269,9 +144,6 @@ if __name__ == "__main__":
     else:
         if legacy_local_dir is not None:
             local_save_dir = legacy_local_dir
-        elif args.num_options is not None and not local_save_dir_provided:
-            # Avoid overwriting default when reducing options
-            local_save_dir = option_prefixed_dir(args.local_save_dir, args.num_options)
         else:
             local_save_dir = args.local_save_dir
 
@@ -282,6 +154,241 @@ if __name__ == "__main__":
         and not augment_save_dir_provided
     ):
         local_save_dir = nocot_prefixed_dir(local_save_dir)
+
+    if (
+        args.num_options is not None
+        and legacy_local_dir is None
+        and not local_save_dir_provided
+        and not augment_save_dir_provided
+    ):
+        # Avoid overwriting defaults when adjusting options
+        local_save_dir = option_prefixed_dir(local_save_dir, args.num_options)
+
+    val_data_source = os.path.basename(os.path.normpath(os.path.expanduser(local_save_dir)))
+
+    if local_dataset_path is not None:
+        # Note: The GSM-MC-Stage dataset only has 'train' and 'test' splits
+        dataset = datasets.load_dataset(local_dataset_path, "default")
+    else:
+        # Load from Hugging Face Hub
+        dataset = datasets.load_dataset(data_source, "default")
+
+    train_dataset = dataset["train"]
+    test_dataset = dataset["test"]
+
+    # The instruction is now part of the prompt construction function (format_multiple_choice_prompt)
+    # instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+
+    rng = random.Random(args.augment_seed)
+    option_labels = BASE_OPTION_LABELS
+
+    if args.num_options is not None:
+        if args.num_options < 1 or args.num_options > len(ALL_OPTION_LABELS):
+            raise ValueError(f"--num_options must be between 1 and {len(ALL_OPTION_LABELS)}; got {args.num_options}")
+
+    def swap_correct_option(options: dict, correct_letter: str, swap_with: str):
+        """Return new options dict and new correct letter after swap."""
+        swapped = dict(options)
+        swapped[correct_letter], swapped[swap_with] = swapped[swap_with], swapped[correct_letter]
+        return swapped, swap_with
+
+    def _extract_number(text: str):
+        if isinstance(text, (int, float)):
+            num_val = float(text) if not isinstance(text, int) else text
+            decimals = 0 if isinstance(text, int) else 6
+            return num_val, decimals
+        text = str(text)
+        match = re.search(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+        if not match:
+            return None, None
+        num_str = match.group(0)
+        is_int = "." not in num_str
+        num_val = float(num_str) if not is_int else int(num_str)
+        decimals = 0 if is_int else len(num_str.split(".")[-1])
+        return num_val, decimals
+
+    def _format_number(value, decimals: int):
+        if decimals == 0:
+            return str(int(value))
+        return f"{value:.{decimals}f}"
+
+    def _generate_numeric_distractors(correct_text: str, existing_texts: set, count: int):
+        correct_val, decimals = _extract_number(correct_text)
+        if correct_val is None:
+            raise ValueError("Cannot derive numeric distractors because the correct option is not numeric.")
+
+        existing_nums = set()
+        for text in existing_texts:
+            num_val, _ = _extract_number(text)
+            if num_val is not None:
+                existing_nums.add(num_val)
+
+        base_offsets = [1, 2, 3, 5, 7, 10, 12, 15, 20, 25, 30, 50, 100]
+        magnitude = abs(correct_val)
+        base_scale = max(1, int(magnitude * 0.05))
+
+        distractors = []
+
+        def try_add(cand):
+            if cand == correct_val or cand in existing_nums:
+                return False
+            cand_text = _format_number(cand, decimals)
+            if cand_text in existing_texts:
+                return False
+            distractors.append(cand_text)
+            existing_texts.add(cand_text)
+            existing_nums.add(cand)
+            return True
+
+        if count >= 2:
+            for off in base_offsets:
+                if try_add(correct_val - off):
+                    break
+            for off in base_offsets:
+                if try_add(correct_val + off):
+                    break
+
+        scale = base_scale
+        attempts = 0
+        while len(distractors) < count and attempts < 10:
+            offsets = sorted(set(base_offsets + [scale, 2 * scale, 3 * scale]))
+            candidates = []
+            for off in offsets:
+                if off <= 0:
+                    continue
+                candidates.append(correct_val - off)
+                candidates.append(correct_val + off)
+            rng.shuffle(candidates)
+            for cand in candidates:
+                if len(distractors) >= count:
+                    break
+                try_add(cand)
+            scale = max(1, scale * 2)
+            attempts += 1
+
+        if len(distractors) < count:
+            raise ValueError("Unable to generate enough numeric distractors. Try a smaller --num_options.")
+        return distractors
+
+    def _expand_options(options: dict, correct_letter: str):
+        """Add numeric distractors to reach args.num_options."""
+        if args.num_options is None or args.num_options <= len(options):
+            return options, correct_letter, None
+
+        if args.num_options > len(ALL_OPTION_LABELS):
+            raise ValueError(f"--num_options exceeds max supported ({len(ALL_OPTION_LABELS)})")
+
+        existing_texts = set(options.values())
+        extra_needed = args.num_options - len(options)
+        correct_text = options[correct_letter]
+        distractors = _generate_numeric_distractors(correct_text, existing_texts, extra_needed)
+        if len(distractors) != extra_needed:
+            raise ValueError("Failed to generate the requested number of distractors.")
+
+        expanded = dict(options)
+        next_labels = [l for l in ALL_OPTION_LABELS if l not in expanded]
+        for label, text in zip(next_labels[:extra_needed], distractors, strict=True):
+            expanded[label] = text
+        return expanded, correct_letter, None
+
+    def _adjust_options(options: dict, correct_letter: str):
+        """Return adjusted options and new correct letter after re-labeling or expansion."""
+        if args.num_options is None or args.num_options == len(options):
+            return options, correct_letter, None
+
+        total_options = len(options)
+        if args.num_options < total_options:
+            other_letters = [l for l in options if l != correct_letter]
+            keep_others = rng.sample(other_letters, args.num_options - 1)
+            selected = [correct_letter] + keep_others
+            selected_ordered = [l for l in option_labels if l in selected]
+
+            new_labels = option_labels[: len(selected_ordered)]
+            remap = dict(zip(selected_ordered, new_labels))
+            reduced = {remap[old]: options[old] for old in selected_ordered}
+            new_correct = remap[correct_letter]
+            return reduced, new_correct, remap
+
+        return _expand_options(options, correct_letter)
+
+    def generate_variants(example: dict, split: str, orig_idx: int, data_source_name: str):
+        """Create one or more variants (augmented) for a single example."""
+        # Copy raw fields so we don't mutate HF dataset internals
+        question_raw = example["Question"]
+        correct_letter = example["Answer"]
+        options = {label: example[label] for label in option_labels}
+
+        if not args.augment:
+            swap_plan = [(correct_letter, None)]  # (new_correct, swap_info)
+        else:
+            times = max(1, args.augment_times)
+            other_letters = [l for l in option_labels if l != correct_letter]
+            rng.shuffle(other_letters)
+            swap_targets = []
+            # Use distinct targets when possible, then sample with replacement
+            for _ in range(times):
+                if other_letters:
+                    swap_targets.append(other_letters.pop())
+                else:
+                    swap_targets.append(rng.choice([l for l in option_labels if l != correct_letter]))
+            swap_plan = []
+            for target in swap_targets:
+                swap_plan.append((target, {"from": correct_letter, "to": target}))
+
+        variants = []
+        for variant_id, (new_correct, swap_info) in enumerate(swap_plan):
+            variant_options = dict(options)
+            if args.augment:
+                variant_options, new_correct = swap_correct_option(variant_options, correct_letter, new_correct)
+
+            # Option reduction or expansion (adjust to num_options if requested)
+            variant_options, new_correct, remap = _adjust_options(variant_options, new_correct)
+
+            question = format_multiple_choice_prompt(
+                question_raw,
+                variant_options,
+                include_cot_phrase=not args.no_cot_phrase,
+            )
+            data = {
+                "data_source": data_source_name,
+                "prompt": [
+                    {
+                        "role": "user",
+                        "content": question,
+                    }
+                ],
+                "ability": "math_mc", # Updated ability type
+                "reward_model": {"style": "rule", "ground_truth": new_correct},
+                "extra_info": {
+                    "split": split,
+                    # Ensure unique indices across variants to keep replay/resume simple
+                    "index": orig_idx * len(swap_plan) + variant_id,
+                    "orig_index": orig_idx,
+                    "augment_variant": variant_id if args.augment else None,
+                    "correct_choice": new_correct,
+                    "question_raw": question_raw,
+                    "A": variant_options.get("A"),
+                    "B": variant_options.get("B"),
+                    "C": variant_options.get("C"),
+                    "D": variant_options.get("D"),
+                    "options": variant_options,
+                    "augment_swap": swap_info,
+                    "option_remap": remap,
+                    "num_options": args.num_options,
+                },
+            }
+            variants.append(data)
+        return variants
+
+    def preprocess_split(dataset_split, split_name: str, data_source_name: str):
+        records = []
+        for idx, ex in enumerate(dataset_split):
+            records.extend(generate_variants(ex, split_name, idx, data_source_name))
+        return datasets.Dataset.from_list(records)
+
+    # Build augmented (or original) datasets with optional duplication
+    train_dataset = preprocess_split(train_dataset, "train", data_source)
+    test_dataset = preprocess_split(test_dataset, "test", val_data_source)
 
     if legacy_local_dir is not None:
         print("Warning: Argument 'local_dir' is deprecated. Please use 'local_save_dir' instead.")

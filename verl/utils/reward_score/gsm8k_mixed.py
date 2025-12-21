@@ -29,6 +29,6 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
             "format_ok": pred is not None,
             "pred": pred if pred is not None else "",
         }
-    if data_source in ["satoshidg/GSM-MC-Stage", "gsm8k_mc"]:
+    if data_source in ["satoshidg/GSM-MC-Stage", "gsm8k_mc", "nocot_gsm_mc_stage"]:
         return gsm8k_mc.compute_score(data_source, solution_str, ground_truth, extra_info)
     raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
