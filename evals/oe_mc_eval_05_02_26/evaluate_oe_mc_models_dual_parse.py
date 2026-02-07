@@ -23,15 +23,21 @@ if str(SCRIPT_DIR) not in sys.path:
 from eval_utils import (
     GenerationConfig,
     ParseMethod,
+    all_gather_objects,
+    barrier_if_needed,
     build_gsm8k_mc_prompt,
     build_gsm8k_prompt,
+    cleanup_distributed_if_needed,
     generate_batched,
+    get_dist_context,
+    init_distributed_if_needed,
     load_model_and_tokenizer,
     now_compact,
     qwen_is_correct_choice,
     qwen_is_correct_number,
     score_gsm8k_mc_with_verl,
     score_gsm8k_with_verl,
+    shard_for_rank,
     write_json,
 )
 
@@ -44,57 +50,19 @@ def _subset(dataset, num_samples: Optional[int]):
     return dataset.select(range(min(int(num_samples), len(dataset))))
 
 
-def evaluate_model_on_gsm8k(
-    *,
-    model,
-    tokenizer,
-    dataset,
-    model_label: str,
-    gen_cfg: GenerationConfig,
-    batch_size: int,
-    prompt_style: str,
-    include_cot_phrase: bool,
-    parse_methods: List[ParseMethod],
-) -> Dict[str, Any]:
-    prompts: List[str] = []
-    metas: List[Dict[str, Any]] = []
-
-    for idx, ex in enumerate(dataset):
-        q = ex["question"]
-        ans = ex["answer"]
-        gt = verl_gsm8k.extract_solution(ans, method="strict") or ""
-        prompt = build_gsm8k_prompt(question=q, prompt_style=prompt_style, include_cot_phrase=include_cot_phrase)
-        prompts.append(prompt)
-        metas.append({"index": idx, "question": q, "answer": ans, "ground_truth": gt, "prompt": prompt})
-
-    responses = generate_batched(model=model, tokenizer=tokenizer, prompts=prompts, gen_cfg=gen_cfg, batch_size=batch_size)
-
-    examples: List[Dict[str, Any]] = []
+def _compute_gsm8k_metrics(examples: List[Dict[str, Any]], parse_methods: List[ParseMethod]) -> Dict[str, Any]:
     agg = {m: {"correct": 0, "format_ok": 0, "total": 0} for m in parse_methods}
     qwen_agg = {"correct": 0, "total": 0}
-
-    for resp, meta in zip(responses, metas):
-        gt = meta["ground_truth"]
-        scores: Dict[str, Any] = {}
+    for ex in examples:
+        scores = ex["scores"]
         for m in parse_methods:
-            s = score_gsm8k_with_verl(completion=resp, ground_truth=gt, method=m)
-            scores[f"verl_{m}"] = s
+            s = scores[f"verl_{m}"]
             agg[m]["correct"] += int(s["correct"])
             agg[m]["format_ok"] += int(s["format_ok"])
             agg[m]["total"] += 1
-
-        q = qwen_is_correct_number(completion=resp, answer=meta["answer"])
-        scores["qwen_original"] = q
+        q = scores["qwen_original"]
         qwen_agg["correct"] += int(q["correct"])
         qwen_agg["total"] += 1
-
-        examples.append(
-            {
-                **meta,
-                "response": resp,
-                "scores": scores,
-            }
-        )
 
     metrics = {
         f"verl_{m}": {
@@ -110,6 +78,105 @@ def evaluate_model_on_gsm8k(
         "correct": qwen_agg["correct"],
         "total": qwen_agg["total"],
     }
+    return metrics
+
+
+def _compute_gsm8k_mc_metrics(examples: List[Dict[str, Any]], parse_methods: List[ParseMethod]) -> Dict[str, Any]:
+    agg = {m: {"correct": 0, "format_ok": 0, "total": 0} for m in parse_methods}
+    qwen_agg = {"correct": 0, "format_ok": 0, "total": 0}
+    for ex in examples:
+        scores = ex["scores"]
+        for m in parse_methods:
+            s = scores[f"verl_{m}"]
+            agg[m]["correct"] += int(s["correct"])
+            agg[m]["format_ok"] += int(s["format_ok"])
+            agg[m]["total"] += 1
+        q = scores["qwen_original"]
+        qwen_agg["correct"] += int(q["correct"])
+        qwen_agg["format_ok"] += int(q["pred"] is not None)
+        qwen_agg["total"] += 1
+
+    metrics = {
+        f"verl_{m}": {
+            "accuracy": (agg[m]["correct"] / agg[m]["total"]) if agg[m]["total"] else 0.0,
+            "format_ok_rate": (agg[m]["format_ok"] / agg[m]["total"]) if agg[m]["total"] else 0.0,
+            "correct": agg[m]["correct"],
+            "total": agg[m]["total"],
+        }
+        for m in parse_methods
+    }
+    metrics["qwen_original"] = {
+        "accuracy": (qwen_agg["correct"] / qwen_agg["total"]) if qwen_agg["total"] else 0.0,
+        "format_ok_rate": (qwen_agg["format_ok"] / qwen_agg["total"]) if qwen_agg["total"] else 0.0,
+        "correct": qwen_agg["correct"],
+        "total": qwen_agg["total"],
+    }
+    return metrics
+
+
+def evaluate_model_on_gsm8k(
+    *,
+    model,
+    tokenizer,
+    dataset,
+    model_label: str,
+    gen_cfg: GenerationConfig,
+    batch_size: int,
+    prompt_style: str,
+    include_cot_phrase: bool,
+    parse_methods: List[ParseMethod],
+    dist_ctx,
+) -> Optional[Dict[str, Any]]:
+    prompts: List[str] = []
+    metas: List[Dict[str, Any]] = []
+
+    for idx, ex in enumerate(dataset):
+        q = ex["question"]
+        ans = ex["answer"]
+        gt = verl_gsm8k.extract_solution(ans, method="strict") or ""
+        prompt = build_gsm8k_prompt(question=q, prompt_style=prompt_style, include_cot_phrase=include_cot_phrase)
+        prompts.append(prompt)
+        metas.append({"index": idx, "question": q, "answer": ans, "ground_truth": gt, "prompt": prompt})
+
+    local_prompts = shard_for_rank(prompts, dist_ctx)
+    local_metas = shard_for_rank(metas, dist_ctx)
+    responses = generate_batched(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=local_prompts,
+        gen_cfg=gen_cfg,
+        batch_size=batch_size,
+    )
+
+    local_examples: List[Dict[str, Any]] = []
+    for resp, meta in zip(responses, local_metas):
+        gt = meta["ground_truth"]
+        scores: Dict[str, Any] = {}
+        for m in parse_methods:
+            s = score_gsm8k_with_verl(completion=resp, ground_truth=gt, method=m)
+            scores[f"verl_{m}"] = s
+
+        q = qwen_is_correct_number(completion=resp, answer=meta["answer"])
+        scores["qwen_original"] = q
+
+        local_examples.append(
+            {
+                **meta,
+                "response": resp,
+                "scores": scores,
+            }
+        )
+
+    gathered = all_gather_objects(local_examples, dist_ctx)
+    if dist_ctx.rank != 0:
+        return None
+
+    examples: List[Dict[str, Any]] = []
+    for shard_examples in gathered:
+        examples.extend(shard_examples)
+    examples.sort(key=lambda ex: int(ex["index"]))
+
+    metrics = _compute_gsm8k_metrics(examples, parse_methods)
 
     return {
         "model_label": model_label,
@@ -133,7 +200,8 @@ def evaluate_model_on_gsm8k_mc(
     prompt_style: str,
     include_cot_phrase: bool,
     parse_methods: List[ParseMethod],
-) -> Dict[str, Any]:
+    dist_ctx,
+) -> Optional[Dict[str, Any]]:
     prompts: List[str] = []
     metas: List[Dict[str, Any]] = []
 
@@ -157,45 +225,39 @@ def evaluate_model_on_gsm8k_mc(
             }
         )
 
-    responses = generate_batched(model=model, tokenizer=tokenizer, prompts=prompts, gen_cfg=gen_cfg, batch_size=batch_size)
+    local_prompts = shard_for_rank(prompts, dist_ctx)
+    local_metas = shard_for_rank(metas, dist_ctx)
+    responses = generate_batched(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=local_prompts,
+        gen_cfg=gen_cfg,
+        batch_size=batch_size,
+    )
 
-    examples: List[Dict[str, Any]] = []
-    agg = {m: {"correct": 0, "format_ok": 0, "total": 0} for m in parse_methods}
-    qwen_agg = {"correct": 0, "format_ok": 0, "total": 0}
-
-    for resp, meta in zip(responses, metas):
+    local_examples: List[Dict[str, Any]] = []
+    for resp, meta in zip(responses, local_metas):
         gt = meta["ground_truth"]
         scores: Dict[str, Any] = {}
         for m in parse_methods:
             s = score_gsm8k_mc_with_verl(completion=resp, ground_truth_letter=gt, method=m)
             scores[f"verl_{m}"] = s
-            agg[m]["correct"] += int(s["correct"])
-            agg[m]["format_ok"] += int(s["format_ok"])
-            agg[m]["total"] += 1
 
         q = qwen_is_correct_choice(completion=resp, gold_letter=gt)
         scores["qwen_original"] = q
-        qwen_agg["correct"] += int(q["correct"])
-        qwen_agg["format_ok"] += int(q["pred"] is not None)
-        qwen_agg["total"] += 1
 
-        examples.append({**meta, "response": resp, "scores": scores})
+        local_examples.append({**meta, "response": resp, "scores": scores})
 
-    metrics = {
-        f"verl_{m}": {
-            "accuracy": (agg[m]["correct"] / agg[m]["total"]) if agg[m]["total"] else 0.0,
-            "format_ok_rate": (agg[m]["format_ok"] / agg[m]["total"]) if agg[m]["total"] else 0.0,
-            "correct": agg[m]["correct"],
-            "total": agg[m]["total"],
-        }
-        for m in parse_methods
-    }
-    metrics["qwen_original"] = {
-        "accuracy": (qwen_agg["correct"] / qwen_agg["total"]) if qwen_agg["total"] else 0.0,
-        "format_ok_rate": (qwen_agg["format_ok"] / qwen_agg["total"]) if qwen_agg["total"] else 0.0,
-        "correct": qwen_agg["correct"],
-        "total": qwen_agg["total"],
-    }
+    gathered = all_gather_objects(local_examples, dist_ctx)
+    if dist_ctx.rank != 0:
+        return None
+
+    examples: List[Dict[str, Any]] = []
+    for shard_examples in gathered:
+        examples.extend(shard_examples)
+    examples.sort(key=lambda ex: int(ex["index"]))
+
+    metrics = _compute_gsm8k_mc_metrics(examples, parse_methods)
 
     return {
         "model_label": model_label,
@@ -221,14 +283,18 @@ def _print_run_summary(run: Dict[str, Any]) -> None:
             print(f"  {k}: acc={v['accuracy']:.2%}{extra} ({v['correct']}/{v['total']})")
 
 
-def _free_model(model) -> None:
+def _free_model(model, tokenizer=None) -> None:
     try:
         import torch
 
         del model
+        if tokenizer is not None:
+            del tokenizer
         gc.collect()
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
     except Exception:
         pass
 
@@ -252,7 +318,7 @@ def main() -> None:
         help="Cap on number of examples per dataset. Use 0 to evaluate the full split. "
         "If not provided, defaults to $NUM_SAMPLES or 0.",
     )
-    parser.add_argument("--batch_size", type=int, default=64, help="Generation batch size (total).")
+    parser.add_argument("--batch_size", type=int, default=32, help="Generation batch size per GPU process.")
 
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--max_length", type=int, default=2048)
@@ -298,42 +364,47 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    gsm8k = load_dataset(args.gsm8k_dataset, args.gsm8k_config, split=args.gsm8k_split)
-    gsm8k_mc = load_dataset(args.mc_dataset, split=args.mc_split)
-    if args.num_samples < 0:
-        raise ValueError("--num_samples must be >= 0 (0 means full dataset).")
-    if args.num_samples > 0:
-        gsm8k = _subset(gsm8k, args.num_samples)
-        gsm8k_mc = _subset(gsm8k_mc, args.num_samples)
+    dist_ctx = get_dist_context()
+    init_distributed_if_needed(dist_ctx)
+    try:
+        gsm8k = load_dataset(args.gsm8k_dataset, args.gsm8k_config, split=args.gsm8k_split)
+        gsm8k_mc = load_dataset(args.mc_dataset, split=args.mc_split)
+        if args.num_samples < 0:
+            raise ValueError("--num_samples must be >= 0 (0 means full dataset).")
+        if args.num_samples > 0:
+            gsm8k = _subset(gsm8k, args.num_samples)
+            gsm8k_mc = _subset(gsm8k_mc, args.num_samples)
 
-    gen_cfg = GenerationConfig(
-        max_new_tokens=args.max_new_tokens,
-        max_length=args.max_length,
-        do_sample=args.do_sample,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty,
-        use_chat_template=not args.no_chat_template,
-        system_prompt=args.system_prompt,
-    )
+        gen_cfg = GenerationConfig(
+            max_new_tokens=args.max_new_tokens,
+            max_length=args.max_length,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            use_chat_template=not args.no_chat_template,
+            system_prompt=args.system_prompt,
+        )
 
-    parse_methods: List[ParseMethod] = [m for m in args.parse_methods]  # type: ignore[assignment]
-    include_cot_phrase = not args.no_cot_phrase
+        parse_methods: List[ParseMethod] = [m for m in args.parse_methods]  # type: ignore[assignment]
+        include_cot_phrase = not args.no_cot_phrase
 
-    runs: List[Dict[str, Any]] = []
+        runs: List[Dict[str, Any]] = []
 
-    # Evaluate OE model first (on both datasets) to avoid holding two models in VRAM.
-    print("\n" + "=" * 80)
-    print("Loading OE model:", args.oe_model)
-    print("=" * 80)
-    model, tok = load_model_and_tokenizer(
-        args.oe_model,
-        torch_dtype=args.torch_dtype,
-        attn_implementation=args.attn_implementation,
-        wandb_mode=args.wandb_mode,
-    )
-    runs.append(
-        evaluate_model_on_gsm8k(
+        # Evaluate OE model first (on both datasets) and clear CUDA cache before loading MC model.
+        if dist_ctx.rank == 0:
+            print("\n" + "=" * 80)
+            print("Loading OE model:", args.oe_model)
+            print("=" * 80)
+        model, tok = load_model_and_tokenizer(
+            args.oe_model,
+            torch_dtype=args.torch_dtype,
+            attn_implementation=args.attn_implementation,
+            wandb_mode=args.wandb_mode,
+            device_map=None if dist_ctx.enabled else "auto",
+            local_rank=dist_ctx.local_rank,
+        )
+        run = evaluate_model_on_gsm8k(
             model=model,
             tokenizer=tok,
             dataset=gsm8k,
@@ -343,10 +414,11 @@ def main() -> None:
             prompt_style=args.prompt_style,
             include_cot_phrase=include_cot_phrase,
             parse_methods=parse_methods,
+            dist_ctx=dist_ctx,
         )
-    )
-    runs.append(
-        evaluate_model_on_gsm8k_mc(
+        if run is not None:
+            runs.append(run)
+        run = evaluate_model_on_gsm8k_mc(
             model=model,
             tokenizer=tok,
             dataset=gsm8k_mc,
@@ -356,22 +428,27 @@ def main() -> None:
             prompt_style=args.prompt_style,
             include_cot_phrase=include_cot_phrase,
             parse_methods=parse_methods,
+            dist_ctx=dist_ctx,
         )
-    )
-    _free_model(model)
+        if run is not None:
+            runs.append(run)
+        _free_model(model, tok)
+        barrier_if_needed(dist_ctx)
 
-    # Evaluate MC model
-    print("\n" + "=" * 80)
-    print("Loading MC model:", args.mc_model)
-    print("=" * 80)
-    model, tok = load_model_and_tokenizer(
-        args.mc_model,
-        torch_dtype=args.torch_dtype,
-        attn_implementation=args.attn_implementation,
-        wandb_mode=args.wandb_mode,
-    )
-    runs.append(
-        evaluate_model_on_gsm8k(
+        # Evaluate MC model
+        if dist_ctx.rank == 0:
+            print("\n" + "=" * 80)
+            print("Loading MC model:", args.mc_model)
+            print("=" * 80)
+        model, tok = load_model_and_tokenizer(
+            args.mc_model,
+            torch_dtype=args.torch_dtype,
+            attn_implementation=args.attn_implementation,
+            wandb_mode=args.wandb_mode,
+            device_map=None if dist_ctx.enabled else "auto",
+            local_rank=dist_ctx.local_rank,
+        )
+        run = evaluate_model_on_gsm8k(
             model=model,
             tokenizer=tok,
             dataset=gsm8k,
@@ -381,10 +458,11 @@ def main() -> None:
             prompt_style=args.prompt_style,
             include_cot_phrase=include_cot_phrase,
             parse_methods=parse_methods,
+            dist_ctx=dist_ctx,
         )
-    )
-    runs.append(
-        evaluate_model_on_gsm8k_mc(
+        if run is not None:
+            runs.append(run)
+        run = evaluate_model_on_gsm8k_mc(
             model=model,
             tokenizer=tok,
             dataset=gsm8k_mc,
@@ -394,83 +472,96 @@ def main() -> None:
             prompt_style=args.prompt_style,
             include_cot_phrase=include_cot_phrase,
             parse_methods=parse_methods,
+            dist_ctx=dist_ctx,
         )
-    )
-    _free_model(model)
+        if run is not None:
+            runs.append(run)
+        _free_model(model, tok)
+        barrier_if_needed(dist_ctx)
 
-    # Save results
-    out_json = args.out_json or f"evals/oe_mc_eval_05_02_26/cross_eval_dual_parse_{now_compact()}.json"
-    payload: Dict[str, Any] = {
-        "config": {
-            "oe_model": args.oe_model,
-            "mc_model": args.mc_model,
-            "gsm8k_dataset": args.gsm8k_dataset,
-            "gsm8k_split": args.gsm8k_split,
-            "mc_dataset": args.mc_dataset,
-            "mc_split": args.mc_split,
-            "num_samples": args.num_samples,
-            "prompt_style": args.prompt_style,
-            "include_cot_phrase": include_cot_phrase,
-            "parse_methods": parse_methods,
-            "generation": gen_cfg.__dict__,
-            "wandb": {
-                "project": args.wandb_project,
-                "entity": args.wandb_entity,
-                "mode": args.wandb_mode,
+        # Non-main ranks only run compute and synchronize.
+        if dist_ctx.rank != 0:
+            return
+
+        # Save results
+        out_json = args.out_json or f"evals/oe_mc_eval_05_02_26/cross_eval_dual_parse_{now_compact()}.json"
+        payload: Dict[str, Any] = {
+            "config": {
+                "oe_model": args.oe_model,
+                "mc_model": args.mc_model,
+                "gsm8k_dataset": args.gsm8k_dataset,
+                "gsm8k_split": args.gsm8k_split,
+                "mc_dataset": args.mc_dataset,
+                "mc_split": args.mc_split,
+                "num_samples": args.num_samples,
+                "prompt_style": args.prompt_style,
+                "include_cot_phrase": include_cot_phrase,
+                "parse_methods": parse_methods,
+                "generation": gen_cfg.__dict__,
+                "wandb": {
+                    "project": args.wandb_project,
+                    "entity": args.wandb_entity,
+                    "mode": args.wandb_mode,
+                },
+                "distributed": {
+                    "enabled": dist_ctx.enabled,
+                    "world_size": dist_ctx.world_size,
+                },
             },
-        },
-        "runs": runs,
-    }
-    write_json(out_json, payload)
+            "runs": runs,
+        }
+        write_json(out_json, payload)
 
-    # Print summary
-    print("\n" + "#" * 80)
-    print("SUMMARY")
-    print("#" * 80)
-    for r in runs:
-        _print_run_summary(r)
-    print(f"\nSaved: {out_json}")
-
-    # Log to W&B (optional).
-    if args.wandb_project and args.wandb_mode != "disabled":
-        import wandb
-
-        run = wandb.init(
-            project=args.wandb_project,
-            entity=(args.wandb_entity or None),
-            name=args.wandb_run_name,
-            group=args.wandb_group,
-            tags=args.wandb_tags,
-            job_type=args.wandb_job_type,
-            mode=args.wandb_mode,
-            config=payload["config"],
-        )
-
-        flat_metrics: Dict[str, Any] = {}
+        # Print summary
+        print("\n" + "#" * 80)
+        print("SUMMARY")
+        print("#" * 80)
         for r in runs:
-            model_label = r["model_label"]
-            dataset = r["dataset"]
-            for parser_name, m in r["metrics"].items():
-                prefix = f"{model_label}/{dataset}/{parser_name}"
-                if "accuracy" in m:
-                    flat_metrics[f"{prefix}/accuracy"] = m["accuracy"]
-                if "format_ok_rate" in m:
-                    flat_metrics[f"{prefix}/format_ok_rate"] = m["format_ok_rate"]
-                if "correct" in m:
-                    flat_metrics[f"{prefix}/correct"] = m["correct"]
-                if "total" in m:
-                    flat_metrics[f"{prefix}/total"] = m["total"]
+            _print_run_summary(r)
+        print(f"\nSaved: {out_json}")
 
-        wandb.log(flat_metrics)
+        # Log to W&B (optional).
+        if args.wandb_project and args.wandb_mode != "disabled":
+            import wandb
 
-        artifact = wandb.Artifact(
-            name=args.wandb_artifact_name,
-            type=args.wandb_artifact_type,
-            metadata=payload["config"],
-        )
-        artifact.add_file(out_json)
-        run.log_artifact(artifact)
-        run.finish()
+            run = wandb.init(
+                project=args.wandb_project,
+                entity=(args.wandb_entity or None),
+                name=args.wandb_run_name,
+                group=args.wandb_group,
+                tags=args.wandb_tags,
+                job_type=args.wandb_job_type,
+                mode=args.wandb_mode,
+                config=payload["config"],
+            )
+
+            flat_metrics: Dict[str, Any] = {}
+            for r in runs:
+                model_label = r["model_label"]
+                dataset = r["dataset"]
+                for parser_name, m in r["metrics"].items():
+                    prefix = f"{model_label}/{dataset}/{parser_name}"
+                    if "accuracy" in m:
+                        flat_metrics[f"{prefix}/accuracy"] = m["accuracy"]
+                    if "format_ok_rate" in m:
+                        flat_metrics[f"{prefix}/format_ok_rate"] = m["format_ok_rate"]
+                    if "correct" in m:
+                        flat_metrics[f"{prefix}/correct"] = m["correct"]
+                    if "total" in m:
+                        flat_metrics[f"{prefix}/total"] = m["total"]
+
+            wandb.log(flat_metrics)
+
+            artifact = wandb.Artifact(
+                name=args.wandb_artifact_name,
+                type=args.wandb_artifact_type,
+                metadata=payload["config"],
+            )
+            artifact.add_file(out_json)
+            run.log_artifact(artifact)
+            run.finish()
+    finally:
+        cleanup_distributed_if_needed(dist_ctx)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ set -euo pipefail
 #   export WANDB_MODE="online"                  # online|offline|disabled
 #   export SKIP_BASE=1                          # skip base model eval
 #   export SKIP_CROSS=1                         # skip OE/MC cross-eval
+#   export MULTI_GPU=1                          # use torchrun when >1 GPU is available
+#   export NUM_PROCESSES=4                      # optional torchrun nproc override
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -44,8 +46,8 @@ export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
 export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$CACHE_BASE/wandb}"
 export WANDB_DIR="${WANDB_DIR:-$REPO_ROOT/wandb}"
 export VERL_RUN_DIR="${VERL_RUN_DIR:-$CACHE_BASE/verl}"
-export WANDB_API_KEY="PUT_WANDB_API_KEY_HERE"
-export SKIP_BASE=1
+export WANDB_API_KEY="PUR_YOUR_API_KEY"
+export SKIP_BASE=0
 export OE_MODEL="tommaso-bendinelli-eth-zurich/multiple_choice_question_study/qwen25_3B_gsm8k:v0"
 export MC_MODEL="tommaso-bendinelli-eth-zurich/multiple_choice_question_study/qwen25_3B_mc_gsm8k:v0"
 export WANDB_PROJECT="gsm8k-evaluation"
@@ -72,7 +74,7 @@ NO_CHAT_TEMPLATE="${NO_CHAT_TEMPLATE:-0}"
 NO_COT_PHRASE="${NO_COT_PHRASE:-0}"
 PARSE_METHODS="${PARSE_METHODS:-strict flexible}"
 
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
 TORCH_DTYPE="${TORCH_DTYPE:-float16}"
@@ -84,6 +86,8 @@ WANDB_MODE="${WANDB_MODE:-online}"
 
 SKIP_BASE="${SKIP_BASE:-0}"
 SKIP_CROSS="${SKIP_CROSS:-0}"
+MULTI_GPU="${MULTI_GPU:-1}"
+NUM_PROCESSES="${NUM_PROCESSES:-}"
 
 mkdir -p "$CACHE_BASE" "$HF_HOME" "$WANDB_CACHE_DIR" "$WANDB_DIR" "$VERL_RUN_DIR"
 
@@ -121,7 +125,7 @@ if [[ "${USE_FLASH_ATTN:-0}" == "1" ]]; then
     ATTN_IMPL="flash_attention_2"
   fi
   echo "[INFO] USE_FLASH_ATTN=1 -> attempting to install flash-attn (may require CUDA toolchain)"
-  python -m pip install -U flash-attn --no-build-isolation || {
+  python -m pip install flash-attn==2.5.7 --no-build-isolation -v || {
     echo "[WARN] flash-attn install failed; continuing without it."
   }
 fi
@@ -146,6 +150,24 @@ try:
 except Exception as e:
   raise SystemExit("[ERROR] torch is not importable in this venv. Install a CUDA-enabled torch build for your system.") from e
 PY
+
+GPU_COUNT="$(python - <<'PY'
+import torch
+print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
+PY
+)"
+
+LAUNCHER=(python -u)
+if [[ "$MULTI_GPU" == "1" && "$GPU_COUNT" -gt 1 ]]; then
+  NPROC="${NUM_PROCESSES:-$GPU_COUNT}"
+  if [[ "$NPROC" -gt "$GPU_COUNT" ]]; then
+    NPROC="$GPU_COUNT"
+  fi
+  LAUNCHER=(torchrun --standalone --nproc_per_node "$NPROC")
+  echo "[INFO] Multi-GPU enabled: $NPROC processes across $GPU_COUNT GPUs (batch_size per process: $BATCH_SIZE)"
+else
+  echo "[INFO] Single-process mode (batch_size: $BATCH_SIZE)"
+fi
 
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   echo "[INFO] Logging into W&B (WANDB_API_KEY is set)"
@@ -202,7 +224,7 @@ if [[ "$SKIP_CROSS" != "1" ]]; then
   fi
 
   echo "[INFO] Running cross-eval (OE+MC models)"
-  python -u "$REPO_ROOT/evals/oe_mc_eval_05_02_26/evaluate_oe_mc_models_dual_parse.py" \
+  "${LAUNCHER[@]}" "$REPO_ROOT/evals/oe_mc_eval_05_02_26/evaluate_oe_mc_models_dual_parse.py" \
     --oe_model "$OE_MODEL" \
     --mc_model "$MC_MODEL" \
     --out_json "$OUT_DIR/cross_eval_oe_mc.json" \
@@ -212,7 +234,7 @@ fi
 
 if [[ "$SKIP_BASE" != "1" ]]; then
   echo "[INFO] Running base Qwen eval"
-  python -u "$REPO_ROOT/evals/oe_mc_eval_05_02_26/evaluate_base_qwen_dual_parse.py" \
+  "${LAUNCHER[@]}" "$REPO_ROOT/evals/oe_mc_eval_05_02_26/evaluate_base_qwen_dual_parse.py" \
     --model "$BASE_MODEL" \
     --out_json "$OUT_DIR/base_qwen.json" \
     --wandb_run_name "base_eval_${RUN_TAG}" \

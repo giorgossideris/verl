@@ -136,6 +136,82 @@ def build_gsm8k_mc_prompt(
 ParseMethod = Literal["strict", "flexible"]
 
 
+@dataclass(frozen=True)
+class DistContext:
+    enabled: bool
+    world_size: int
+    rank: int
+    local_rank: int
+
+
+def get_dist_context() -> DistContext:
+    world_size = max(int(os.environ.get("WORLD_SIZE", "1")), 1)
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    return DistContext(
+        enabled=world_size > 1,
+        world_size=world_size,
+        rank=rank,
+        local_rank=local_rank,
+    )
+
+
+def init_distributed_if_needed(dist_ctx: DistContext) -> None:
+    if not dist_ctx.enabled:
+        return
+
+    import torch
+    import torch.distributed as dist
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(dist_ctx.local_rank)
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            rank=dist_ctx.rank,
+            world_size=dist_ctx.world_size,
+        )
+
+
+def barrier_if_needed(dist_ctx: DistContext) -> None:
+    if not dist_ctx.enabled:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def all_gather_objects(local_obj: Any, dist_ctx: DistContext) -> List[Any]:
+    if not dist_ctx.enabled:
+        return [local_obj]
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return [local_obj]
+
+    gathered: List[Any] = [None for _ in range(dist_ctx.world_size)]
+    dist.all_gather_object(gathered, local_obj)
+    return gathered
+
+
+def cleanup_distributed_if_needed(dist_ctx: DistContext) -> None:
+    if not dist_ctx.enabled:
+        return
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def shard_for_rank(items: Sequence[Any], dist_ctx: DistContext) -> List[Any]:
+    if not dist_ctx.enabled:
+        return list(items)
+    return [item for idx, item in enumerate(items) if idx % dist_ctx.world_size == dist_ctx.rank]
+
+
 def score_gsm8k_with_verl(*, completion: str, ground_truth: str, method: ParseMethod) -> Dict[str, Any]:
     pred = verl_gsm8k.extract_solution(completion, method=method)
     score = float(
@@ -278,6 +354,8 @@ def load_model_and_tokenizer(
     attn_implementation: Optional[str] = None,
     wandb_mode: str = "online",
     wandb_cache_root: Optional[str] = None,
+    device_map: Optional[str] = "auto",
+    local_rank: Optional[int] = None,
 ):
     # Imports are inside the function to keep file import lightweight.
     import torch
@@ -309,9 +387,10 @@ def load_model_and_tokenizer(
 
     model_kwargs: Dict[str, Any] = dict(
         torch_dtype=dtype,
-        device_map="auto",
         trust_remote_code=True,
     )
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
     if attn_implementation:
         model_kwargs["attn_implementation"] = attn_implementation
 
@@ -319,6 +398,13 @@ def load_model_and_tokenizer(
         model_name_or_path,
         **model_kwargs,
     ).eval()
+    if device_map is None:
+        if torch.cuda.is_available():
+            if local_rank is None:
+                local_rank = 0
+            model.to(torch.device(f"cuda:{local_rank}"))
+        else:
+            model.to(torch.device("cpu"))
     return model, tokenizer
 
 

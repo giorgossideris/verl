@@ -62,6 +62,10 @@ python evals/oe_mc_eval_05_02_26/evaluate_base_qwen_dual_parse.py \
 - `--num_samples X` (or env `NUM_SAMPLES=X`)
   - If `X > 0`: evaluate only the first `X` instances from each split.
   - If `X = 0`: evaluate on the full split (default).
+- Multi-GPU behavior
+  - The eval scripts support `torchrun` data-parallel evaluation (`WORLD_SIZE > 1`).
+  - Each rank processes a shard of prompts, and rank 0 gathers/merges outputs before scoring + writing JSON.
+  - In `run_evals.sh`, `BATCH_SIZE` is per-GPU process (default `32`), and `MULTI_GPU=1` auto-launches `torchrun` when multiple GPUs are available.
 - W&B (artifacts)
   - `--wandb_project <name>` enables W&B logging and uploads the output JSON as an artifact.
   - `--wandb_entity <entity>` optional.
