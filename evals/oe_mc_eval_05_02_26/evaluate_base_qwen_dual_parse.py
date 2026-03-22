@@ -22,6 +22,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from eval_utils import (
     GenerationConfig,
+    INFERENCE_OVERRIDE_FLAGS,
     ParseMethod,
     all_gather_objects,
     barrier_if_needed,
@@ -35,9 +36,14 @@ from eval_utils import (
     now_compact,
     qwen_is_correct_choice,
     qwen_is_correct_number,
+    find_explicit_cli_flags,
+    list_eval_inference_ids,
+    resolve_eval_inference_profile,
+    resolve_num_samples,
     score_gsm8k_mc_with_verl,
     score_gsm8k_with_verl,
     shard_for_rank,
+    validate_inference_id_args,
     write_json,
 )
 
@@ -275,6 +281,7 @@ def evaluate_one_model(
 
 
 def main() -> None:
+    explicit_decoding_flags = find_explicit_cli_flags(sys.argv[1:], INFERENCE_OVERRIDE_FLAGS)
     parser = argparse.ArgumentParser(description="Eval a base/original Qwen model on GSM8K + GSM8K-MC with dual parsing.")
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct", help="Model (local dir or HF repo id).")
 
@@ -287,11 +294,17 @@ def main() -> None:
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=int(os.environ.get("NUM_SAMPLES", "0")),
-        help="Cap on number of examples per dataset. Use 0 to evaluate the full split. "
-        "If not provided, defaults to $NUM_SAMPLES or 0.",
+        default=None,
+        help="Optional cap on number of examples per dataset. Omit for full split. "
+        "If omitted, a positive $NUM_SAMPLES value is used when set.",
     )
     parser.add_argument("--batch_size", type=int, default=32, help="Generation batch size per GPU process.")
+    parser.add_argument(
+        "--inference_id",
+        default=None,
+        choices=list_eval_inference_ids(),
+        help="Named inference profile. Cannot be combined with manual decoding flags.",
+    )
 
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--max_length", type=int, default=2048)
@@ -336,28 +349,47 @@ def main() -> None:
     parser.add_argument("--wandb_artifact_type", default="eval_results")
 
     args = parser.parse_args()
+    try:
+        validate_inference_id_args(
+            inference_id=args.inference_id,
+            explicit_decoding_flags=explicit_decoding_flags,
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
     dist_ctx = get_dist_context()
     init_distributed_if_needed(dist_ctx)
     try:
+        num_samples, num_samples_source = resolve_num_samples(args.num_samples, os.environ.get("NUM_SAMPLES"))
         gsm8k = load_dataset(args.gsm8k_dataset, args.gsm8k_config, split=args.gsm8k_split)
         gsm8k_mc = load_dataset(args.mc_dataset, split=args.mc_split)
-        if args.num_samples < 0:
-            raise ValueError("--num_samples must be >= 0 (0 means full dataset).")
-        if args.num_samples > 0:
-            gsm8k = _subset(gsm8k, args.num_samples)
-            gsm8k_mc = _subset(gsm8k_mc, args.num_samples)
+        if num_samples is not None:
+            gsm8k = _subset(gsm8k, num_samples)
+            gsm8k_mc = _subset(gsm8k_mc, num_samples)
 
-        gen_cfg = GenerationConfig(
-            max_new_tokens=args.max_new_tokens,
-            max_length=args.max_length,
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            repetition_penalty=args.repetition_penalty,
-            use_chat_template=not args.no_chat_template,
-            system_prompt=args.system_prompt,
-        )
+        inference_profile = resolve_eval_inference_profile(args.inference_id)
+        if inference_profile is not None:
+            gen_cfg = GenerationConfig(
+                max_new_tokens=int(inference_profile["max_new_tokens"]),
+                max_length=int(inference_profile["max_length"]),
+                do_sample=bool(inference_profile["do_sample"]),
+                temperature=float(inference_profile["temperature"]),
+                top_p=float(inference_profile["top_p"]),
+                repetition_penalty=float(inference_profile["repetition_penalty"]),
+                use_chat_template=bool(inference_profile["use_chat_template"]),
+                system_prompt=str(inference_profile["system_prompt"]),
+            )
+        else:
+            gen_cfg = GenerationConfig(
+                max_new_tokens=args.max_new_tokens,
+                max_length=args.max_length,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                use_chat_template=not args.no_chat_template,
+                system_prompt=args.system_prompt,
+            )
 
         parse_methods: List[ParseMethod] = [m for m in args.parse_methods]  # type: ignore[assignment]
         include_cot_phrase = not args.no_cot_phrase
@@ -388,7 +420,10 @@ def main() -> None:
                 "gsm8k_split": args.gsm8k_split,
                 "mc_dataset": args.mc_dataset,
                 "mc_split": args.mc_split,
-                "num_samples": args.num_samples,
+                "num_samples": num_samples,
+                "num_samples_source": num_samples_source,
+                "inference_id": args.inference_id,
+                "inference_profile": inference_profile,
                 "prompt_style": args.prompt_style,
                 "include_cot_phrase": include_cot_phrase,
                 "parse_methods": parse_methods,

@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from reliable_gsm8k.backends import create_generation_backend, get_backend_runtime_metadata
 from reliable_gsm8k.judge import JudgeVerdict, parse_judge_output
 from reliable_gsm8k.parsing import extract_generated_answer, extract_reasoning_block, format_gsm8k_cot_answer, parse_gold_answer, values_equal
-from reliable_gsm8k.profiles import get_generator_profile, get_judge_profile
+from reliable_gsm8k.profiles import get_generator_profile, get_inference_profile, get_judge_profile
 from reliable_gsm8k.prompts import (
     build_correct_solution_prompt,
     build_incorrect_solution_prompt,
@@ -201,6 +201,21 @@ def _mistake_hint_for_attempt(attempt_index: int) -> str:
     return _INCORRECT_MISTAKE_HINTS[attempt_index % len(_INCORRECT_MISTAKE_HINTS)]
 
 
+def _build_generator_sampling(*, inference_config: dict[str, Any], seed: int) -> dict[str, Any]:
+    return {
+        "max_tokens": int(inference_config.get("max_new_tokens", 512)),
+        "max_length": int(inference_config.get("max_length", 2048)),
+        "do_sample": bool(inference_config.get("do_sample", False)),
+        "repetition_penalty": float(inference_config.get("repetition_penalty", 1.0)),
+        "temperature": float(inference_config.get("temperature", 1.0)),
+        "top_p": float(inference_config.get("top_p", 1.0)),
+        "use_chat_template": bool(inference_config.get("use_chat_template", True)),
+        "system_prompt": str(inference_config.get("system_prompt", "You are a helpful assistant.") or ""),
+        "n": 1,
+        "seed": seed,
+    }
+
+
 def _try_accept_solution(
     *,
     role: str,
@@ -275,14 +290,13 @@ def _generate_one(
     *,
     generator_backend,
     prompt: str,
-    generator_temperature: float,
-    generator_max_tokens: int,
+    inference_config: dict[str, Any],
     seed: int,
     metadata: dict[str, Any],
 ) -> tuple[str, dict[str, Any]]:
     response = generator_backend.generate(
         prompt=prompt,
-        sampling={"temperature": generator_temperature, "max_tokens": generator_max_tokens, "n": 1, "seed": seed},
+        sampling=_build_generator_sampling(inference_config=inference_config, seed=seed),
         metadata=metadata,
     )[0]
     return response.text, {"text": response.text, "raw_response": response.raw_response}
@@ -296,8 +310,7 @@ def _collect_correct_solution(
     generator_model_name: str,
     judge_backend,
     judge_model_name: str | None,
-    generator_temperature: float,
-    generator_max_tokens: int,
+    inference_config: dict[str, Any],
     judge_max_tokens: int,
     correct_max_attempts: int,
     seed: int,
@@ -311,8 +324,7 @@ def _collect_correct_solution(
         completion, generation_raw = _generate_one(
             generator_backend=generator_backend,
             prompt=prompt,
-            generator_temperature=generator_temperature,
-            generator_max_tokens=generator_max_tokens,
+            inference_config=inference_config,
             seed=seed + 1000 + attempt_index,
             metadata={"item_id": item_id, "role": "correct", "attempt_index": attempt_index},
         )
@@ -345,8 +357,7 @@ def _collect_incorrect_solutions(
     generator_model_name: str,
     judge_backend,
     judge_model_name: str | None,
-    generator_temperature: float,
-    generator_max_tokens: int,
+    inference_config: dict[str, Any],
     judge_max_tokens: int,
     incorrect_target_count: int,
     incorrect_max_attempts: int,
@@ -373,8 +384,7 @@ def _collect_incorrect_solutions(
         completion, generation_raw = _generate_one(
             generator_backend=generator_backend,
             prompt=prompt,
-            generator_temperature=generator_temperature,
-            generator_max_tokens=generator_max_tokens,
+            inference_config=inference_config,
             seed=seed + 3000 + attempt_index,
             metadata={"item_id": item_id, "role": "incorrect", "attempt_index": attempt_index},
         )
@@ -568,6 +578,7 @@ def merge_run_shards(
     split: str,
     output_root: Path,
     generator_profile_name: str,
+    inference_profile_name: str,
     judge_profile_name: str | None,
     use_judge: bool,
     num_workers: int,
@@ -617,6 +628,8 @@ def merge_run_shards(
         "split": split,
         "max_items": max_items,
         "generator_profile": generator_profile_name,
+        "inference_profile": inference_profile_name,
+        "inference_config": shard_manifests[0].get("inference_config", {}),
         "judge_profile": judge_profile_name if use_judge else None,
         "generator_runtime": shard_manifests[0].get("generator_runtime", {}),
         "judge_runtime": shard_manifests[0].get("judge_runtime", {"enabled": False}),
@@ -640,9 +653,8 @@ def build_run(
     max_items: int | None,
     output_root: Path,
     generator_profile_name: str,
+    inference_profile_name: str,
     judge_profile_name: str | None,
-    generator_temperature: float,
-    generator_max_tokens: int,
     judge_max_tokens: int,
     incorrect_target_count: int,
     incorrect_max_attempts: int,
@@ -654,6 +666,7 @@ def build_run(
     gpu_id: str | None = None,
 ) -> dict[str, Any]:
     generator_config = get_generator_profile(generator_profile_name)
+    inference_config = get_inference_profile(inference_profile_name)
     generator_backend = create_generation_backend(generator_config)
     generator_model_name = str(generator_config["model_name"])
     judge_config = get_judge_profile(judge_profile_name) if use_judge and judge_profile_name is not None else None
@@ -680,6 +693,8 @@ def build_run(
         "split": split,
         "max_items": max_items,
         "generator_profile": generator_profile_name,
+        "inference_profile": inference_profile_name,
+        "inference_config": inference_config,
         "judge_profile": judge_profile_name if use_judge else None,
         "generator_runtime": get_backend_runtime_metadata(generator_backend, generator_config),
         "judge_runtime": get_backend_runtime_metadata(judge_backend, judge_config) if judge_config is not None else {"enabled": False},
@@ -744,8 +759,7 @@ def build_run(
                 generator_model_name=generator_model_name,
                 judge_backend=judge_backend,
                 judge_model_name=judge_model_name,
-                generator_temperature=generator_temperature,
-                generator_max_tokens=generator_max_tokens,
+                inference_config=inference_config,
                 judge_max_tokens=judge_max_tokens,
                 correct_max_attempts=correct_max_attempts,
                 seed=per_item_seed,
@@ -760,8 +774,7 @@ def build_run(
                 generator_model_name=generator_model_name,
                 judge_backend=judge_backend,
                 judge_model_name=judge_model_name,
-                generator_temperature=generator_temperature,
-                generator_max_tokens=generator_max_tokens,
+                inference_config=inference_config,
                 judge_max_tokens=judge_max_tokens,
                 incorrect_target_count=incorrect_target_count,
                 incorrect_max_attempts=incorrect_max_attempts,

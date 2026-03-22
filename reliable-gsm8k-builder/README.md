@@ -29,6 +29,24 @@ Generator profiles:
 - `qwen25_3b`
 - `gpt4o_mini`
 
+Inference profiles:
+
+- `greedy` (default)
+- `sample_balanced`
+- `sample_creative`
+- `greedy_different_system_prompt_test`
+- `greedy_bad_math_system_prompt_test`
+
+Inference profiles define decoding and prompt formatting behavior:
+
+- `max_new_tokens`, `max_length`
+- `do_sample`, `temperature`, `top_p`, `repetition_penalty`
+- `use_chat_template`
+- `system_prompt`
+
+By default, built-in profiles use `use_chat_template=true` and
+`system_prompt="You are a helpful assistant."`.
+
 Judge profiles:
 
 - `judgelm_7b`
@@ -46,7 +64,8 @@ python run_build.py \
   --run-id smoke-qwen \
   --split train \
   --num-samples 20 \
-  --generator-profile qwen25_3b
+  --generator-profile qwen25_3b \
+  --inference-profile greedy
 ```
 
 Or with OpenAI for generation:
@@ -58,8 +77,11 @@ python run_build.py \
   --run-id smoke-gpt \
   --split train \
   --num-samples 20 \
-  --generator-profile gpt4o_mini
+  --generator-profile gpt4o_mini \
+  --inference-profile sample_balanced
 ```
+
+Decoding is profile-only (`--inference-profile`); legacy per-run temperature/max-token flags are disabled.
 
 Just 10 samples:
 

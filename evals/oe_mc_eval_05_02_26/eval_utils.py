@@ -18,6 +18,9 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+BUILDER_SRC = REPO_ROOT / "reliable-gsm8k-builder" / "src"
+if str(BUILDER_SRC) not in sys.path:
+    sys.path.insert(0, str(BUILDER_SRC))
 
 
 # -----------------------------------------------------------------------------
@@ -26,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from verl.utils.reward_score import gsm8k as verl_gsm8k
 from verl.utils.reward_score import gsm8k_mc as verl_gsm8k_mc
+from reliable_gsm8k.profiles import INFERENCE_PROFILES, get_inference_profile
 
 
 # -----------------------------------------------------------------------------
@@ -267,6 +271,52 @@ class GenerationConfig:
     system_prompt: str = "You are a helpful assistant."
 
 
+INFERENCE_OVERRIDE_FLAGS: Tuple[str, ...] = (
+    "--max_new_tokens",
+    "--max_length",
+    "--do_sample",
+    "--temperature",
+    "--top_p",
+    "--repetition_penalty",
+    "--no_chat_template",
+    "--system_prompt",
+)
+
+
+def list_eval_inference_ids() -> List[str]:
+    return sorted(INFERENCE_PROFILES.keys())
+
+
+def resolve_eval_inference_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    if name is None:
+        return None
+    if name not in INFERENCE_PROFILES:
+        known = ", ".join(list_eval_inference_ids())
+        raise ValueError(f"Unknown --inference_id '{name}'. Available: {known}")
+    return get_inference_profile(name)
+
+
+def find_explicit_cli_flags(argv: Sequence[str], flags: Sequence[str]) -> List[str]:
+    flag_set = set(flags)
+    explicit: set[str] = set()
+    for token in argv:
+        if not token.startswith("--"):
+            continue
+        option = token.split("=", 1)[0]
+        if option in flag_set:
+            explicit.add(option)
+    return sorted(explicit)
+
+
+def validate_inference_id_args(*, inference_id: Optional[str], explicit_decoding_flags: Sequence[str]) -> None:
+    if inference_id is None:
+        return
+    if not explicit_decoding_flags:
+        return
+    joined = ", ".join(explicit_decoding_flags)
+    raise ValueError(f"--inference_id cannot be combined with manual decoding flags: {joined}")
+
+
 def _get_input_device(model) -> "Any":
     # device_map="auto" shards params; inputs must be on the device of the first param.
     return next(model.parameters()).device
@@ -497,3 +547,31 @@ def write_json(path: str, payload: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def resolve_num_samples(cli_value: Optional[int], env_value: Optional[str]) -> Tuple[Optional[int], str]:
+    """
+    Resolve the effective sample cap.
+
+    Returns:
+        (num_samples, source)
+        - num_samples: None means full split
+        - source: one of {"all", "env", "cli"}
+    """
+    if cli_value is not None:
+        if cli_value <= 0:
+            raise ValueError("--num_samples must be > 0 when provided. Omit it to evaluate the full split.")
+        return int(cli_value), "cli"
+
+    if env_value is None or str(env_value).strip() == "":
+        return None, "all"
+
+    raw = str(env_value).strip()
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError("NUM_SAMPLES must be a positive integer when set.") from e
+
+    if value <= 0:
+        raise ValueError("NUM_SAMPLES must be > 0 when set. Unset it to evaluate the full split.")
+    return value, "env"

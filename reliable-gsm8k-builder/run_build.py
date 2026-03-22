@@ -33,10 +33,8 @@ def _spawn_multi_gpu_workers(args: argparse.Namespace, *, script_path: Path, gpu
                 str(Path(args.output_root).expanduser()),
                 "--generator-profile",
                 args.generator_profile,
-                "--generator-temperature",
-                str(args.generator_temperature),
-                "--generator-max-tokens",
-                str(args.generator_max_tokens),
+                "--inference-profile",
+                args.inference_profile,
                 "--judge-max-tokens",
                 str(args.judge_max_tokens),
                 "--incorrect-target-count",
@@ -88,10 +86,21 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=None, help="Alias for --max-items when you want to run only a small sample.")
     parser.add_argument("--output-root", default=str(SCRIPT_DIR / "runs"), help="Directory that will contain run outputs.")
     parser.add_argument("--generator-profile", default="qwen25_3b", help="Built-in generator profile name.")
+    parser.add_argument("--inference-profile", default="greedy", help="Built-in inference profile name.")
     parser.add_argument("--judge-profile", default="judgelm_7b", help="Built-in judge profile name if --use-judge is enabled.")
     parser.add_argument("--use-judge", action="store_true", help="Use a judge model to verify generated numeric answers. Disabled by default.")
-    parser.add_argument("--generator-temperature", type=float, default=0.8, help="Sampling temperature for generation.")
-    parser.add_argument("--generator-max-tokens", type=int, default=64, help="Max generation tokens.")
+    parser.add_argument(
+        "--generator-temperature",
+        type=float,
+        default=None,
+        help="Deprecated: decoding is now controlled by --inference-profile only.",
+    )
+    parser.add_argument(
+        "--generator-max-tokens",
+        type=int,
+        default=None,
+        help="Deprecated: decoding is now controlled by --inference-profile only.",
+    )
     parser.add_argument("--judge-max-tokens", type=int, default=192, help="Max judge tokens.")
     parser.add_argument("--incorrect-target-count", type=int, default=4, help="Required accepted incorrect solutions.")
     parser.add_argument("--incorrect-max-attempts", type=int, default=24, help="Max generation attempts for incorrect solutions.")
@@ -106,6 +115,11 @@ def main() -> None:
 
     if args.max_items is not None and args.num_samples is not None and args.max_items != args.num_samples:
         parser.error("--max-items and --num-samples were both set with different values")
+    if args.generator_temperature is not None or args.generator_max_tokens is not None:
+        parser.error(
+            "--generator-temperature/--generator-max-tokens are disabled. "
+            "Use --inference-profile to control decoding."
+        )
     args.effective_max_items = args.num_samples if args.num_samples is not None else args.max_items
 
     output_root = Path(args.output_root).expanduser()
@@ -128,6 +142,7 @@ def main() -> None:
             split=args.split,
             output_root=output_root,
             generator_profile_name=args.generator_profile,
+            inference_profile_name=args.inference_profile,
             judge_profile_name=args.judge_profile,
             use_judge=args.use_judge,
             num_workers=len(visible_gpu_ids),
@@ -147,9 +162,8 @@ def main() -> None:
         max_items=args.effective_max_items,
         output_root=output_root,
         generator_profile_name=args.generator_profile,
+        inference_profile_name=args.inference_profile,
         judge_profile_name=args.judge_profile,
-        generator_temperature=args.generator_temperature,
-        generator_max_tokens=args.generator_max_tokens,
         judge_max_tokens=args.judge_max_tokens,
         incorrect_target_count=args.incorrect_target_count,
         incorrect_max_attempts=args.incorrect_max_attempts,

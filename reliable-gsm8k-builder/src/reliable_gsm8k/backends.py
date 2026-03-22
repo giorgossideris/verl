@@ -141,6 +141,16 @@ def _freeze_max_memory(max_memory: Any) -> Any:
     return tuple(sorted((str(key), str(value)) for key, value in max_memory.items()))
 
 
+def _build_chat_messages(*, prompt: str, use_chat_template: bool, system_prompt: Any) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if use_chat_template:
+        prompt_text = "" if system_prompt is None else str(system_prompt)
+        if prompt_text.strip():
+            messages.append({"role": "system", "content": prompt_text})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
 @dataclass
 class OpenAICompatibleBackend:
     model_name: str
@@ -152,12 +162,27 @@ class OpenAICompatibleBackend:
     retry_max_seconds: float = 30.0
 
     def generate(self, *, prompt: str, sampling: dict[str, Any], metadata: dict[str, Any] | None = None) -> list[GenerationResponse]:
+        temperature = float(sampling.get("temperature", 0.0))
+        top_p = float(sampling.get("top_p", 1.0))
+        do_sample = sampling.get("do_sample")
+        use_chat_template = bool(sampling.get("use_chat_template", True))
+        system_prompt = sampling.get("system_prompt", "You are a helpful assistant.")
+        if do_sample is None:
+            do_sample = temperature > 0.0 or top_p < 1.0
+        if not bool(do_sample):
+            # OpenAI-style APIs do not expose `do_sample`; force deterministic settings.
+            temperature = 0.0
+            top_p = 1.0
         payload = {
             "model": self.model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": sampling.get("temperature", 0.0),
+            "messages": _build_chat_messages(
+                prompt=prompt,
+                use_chat_template=use_chat_template,
+                system_prompt=system_prompt,
+            ),
+            "temperature": temperature,
             "max_tokens": sampling.get("max_tokens", 512),
-            "top_p": sampling.get("top_p", 1.0),
+            "top_p": top_p,
             "n": sampling.get("n", 1),
             "seed": sampling.get("seed"),
         }
@@ -320,11 +345,19 @@ class TransformersCausalLMBackend:
         _TRANSFORMERS_MODEL_CACHE[cache_key] = cached
         return cached
 
-    def _render_prompt(self, prompt: str) -> str:
+    def _render_prompt(self, *, prompt: str, sampling: dict[str, Any]) -> str:
+        use_chat_template = bool(sampling.get("use_chat_template", True))
+        if not use_chat_template:
+            return prompt
         chat_template = getattr(self._tokenizer, "chat_template", None)
         if chat_template:
+            system_prompt = sampling.get("system_prompt", "You are a helpful assistant.")
             return self._tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
+                _build_chat_messages(
+                    prompt=prompt,
+                    use_chat_template=True,
+                    system_prompt=system_prompt,
+                ),
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -333,8 +366,13 @@ class TransformersCausalLMBackend:
     def generate(self, *, prompt: str, sampling: dict[str, Any], metadata: dict[str, Any] | None = None) -> list[GenerationResponse]:
         import torch
 
-        rendered_prompt = self._render_prompt(prompt)
-        encoded_inputs = self._tokenizer(rendered_prompt, return_tensors="pt")
+        rendered_prompt = self._render_prompt(prompt=prompt, sampling=sampling)
+        max_length_raw = sampling.get("max_length")
+        tokenizer_kwargs: dict[str, Any] = {"return_tensors": "pt"}
+        if max_length_raw is not None:
+            tokenizer_kwargs["truncation"] = True
+            tokenizer_kwargs["max_length"] = int(max_length_raw)
+        encoded_inputs = self._tokenizer(rendered_prompt, **tokenizer_kwargs)
         if self._input_device:
             encoded_inputs = {key: value.to(self._input_device) for key, value in encoded_inputs.items()}
 
@@ -343,14 +381,19 @@ class TransformersCausalLMBackend:
         max_new_tokens = int(sampling.get("max_tokens", 512))
         temperature = float(sampling.get("temperature", 0.0))
         top_p = float(sampling.get("top_p", 1.0))
+        repetition_penalty = float(sampling.get("repetition_penalty", 1.0))
         base_seed = sampling.get("seed")
-        do_sample = temperature > 0.0 or top_p < 1.0
+        do_sample = sampling.get("do_sample")
+        if do_sample is None:
+            do_sample = temperature > 0.0 or top_p < 1.0
+        do_sample = bool(do_sample)
 
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
             "pad_token_id": self._tokenizer.pad_token_id or self._tokenizer.eos_token_id,
             "eos_token_id": self._tokenizer.eos_token_id,
             "do_sample": do_sample,
+            "repetition_penalty": repetition_penalty,
             "use_cache": self.generation_use_cache,
         }
         if do_sample:
