@@ -150,6 +150,14 @@ trainer:
   del_local_ckpt_after_load: False
   val_before_train: True
   test_freq: -1
+
+  # Early stopping: stop if a validation metric does not improve for N validation steps.
+  # Disabled unless early_stop_metric is set and early_stop_patience > 0.
+  early_stop_metric: null
+  early_stop_patience: 0
+  # Optional: "max" or "min". Defaults to best_ckpt_mode or "max" if unset.
+  early_stop_mode: null
+
   critic_warmup: 0
   default_hdfs_dir: null
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}

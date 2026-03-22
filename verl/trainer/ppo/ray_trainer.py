@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -336,6 +337,12 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self._best_ckpt_value = None
+        self._best_ckpt_step = None
+        self._early_stop_best_value = None
+        self._early_stop_best_step = None
+        self._early_stop_bad_count = 0
+        self._early_stop_missing_metric_warned = False
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = (
@@ -799,6 +806,84 @@ class RayPPOTrainer:
                 rm_resource_pool=rm_resource_pool,
             )
 
+    def _maybe_update_best_checkpoint(self, val_metrics: dict):
+        key = self.config.trainer.get("best_ckpt_metric", None)
+        if not key or key not in val_metrics:
+            return
+        try:
+            value = float(val_metrics[key])
+        except Exception:
+            return
+        mode = self.config.trainer.get("best_ckpt_mode", "max")
+        best = self._best_ckpt_value
+        improved = self._metric_improved(value=value, best=best, mode=mode)
+        if not improved:
+            return
+        self._best_ckpt_value = value
+        self._best_ckpt_step = self.global_steps
+        default_dir = self.config.trainer.default_local_dir
+        src_dir = os.path.join(default_dir, f"global_step_{self.global_steps}")
+        if not os.path.exists(src_dir):
+            self._save_checkpoint()
+        best_dir = self.config.trainer.get("best_ckpt_dir", None) or os.path.join(default_dir, "best")
+        try:
+            shutil.rmtree(best_dir)
+        except FileNotFoundError:
+            pass
+        shutil.copytree(src_dir, best_dir)
+        if self.config.trainer.get("best_ckpt_keep_only", False):
+            for name in os.listdir(default_dir):
+                if name.startswith("global_step_") and name != f"global_step_{self.global_steps}":
+                    shutil.rmtree(os.path.join(default_dir, name), ignore_errors=True)
+        print(f"[best_ckpt] {key}={value} at step {self.global_steps} -> {best_dir}")
+
+    def _metric_improved(self, value: float, best: Optional[float], mode: str) -> bool:
+        if best is None:
+            return True
+        if mode == "min":
+            return value < best
+        return value > best
+
+    def _maybe_check_early_stop(self, val_metrics: dict) -> bool:
+        key = self.config.trainer.get("early_stop_metric", None)
+        patience = self.config.trainer.get("early_stop_patience", None)
+        if not key or patience is None or patience <= 0:
+            return False
+        if key not in val_metrics:
+            if not self._early_stop_missing_metric_warned:
+                print(f"[early_stop] metric '{key}' not found in validation metrics; skipping early stopping checks.")
+                self._early_stop_missing_metric_warned = True
+            return False
+        try:
+            value = float(val_metrics[key])
+        except Exception:
+            if not self._early_stop_missing_metric_warned:
+                print(f"[early_stop] metric '{key}' is not numeric; skipping early stopping checks.")
+                self._early_stop_missing_metric_warned = True
+            return False
+
+        mode = self.config.trainer.get("early_stop_mode", None) or self.config.trainer.get("best_ckpt_mode", "max")
+        if mode not in ("min", "max"):
+            print(f"[early_stop] invalid early_stop_mode '{mode}', using 'max'.")
+            mode = "max"
+
+        improved = self._metric_improved(value=value, best=self._early_stop_best_value, mode=mode)
+        if improved:
+            self._early_stop_best_value = value
+            self._early_stop_best_step = self.global_steps
+            self._early_stop_bad_count = 0
+            return False
+
+        self._early_stop_bad_count += 1
+        if self._early_stop_bad_count >= int(patience):
+            print(
+                f"[early_stop] {key} did not improve for {patience} validation steps "
+                f"(best={self._early_stop_best_value} at step {self._early_stop_best_step}); "
+                f"stopping at step {self.global_steps}."
+            )
+            return True
+        return False
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1130,6 +1215,8 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
+            self._maybe_update_best_checkpoint(val_metrics)
+            self._maybe_check_early_stop(val_metrics)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1159,6 +1246,7 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                should_early_stop = False
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1381,9 +1469,10 @@ class RayPPOTrainer:
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
+                        last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    self._maybe_update_best_checkpoint(val_metrics)
+                    should_early_stop = self._maybe_check_early_stop(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
@@ -1459,6 +1548,13 @@ class RayPPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
+                if should_early_stop:
+                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    pprint(f"Early stopping validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 

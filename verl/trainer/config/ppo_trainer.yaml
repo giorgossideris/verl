@@ -195,6 +195,13 @@ trainer:
   # Validation frequency (in training iterations)
   test_freq: -1
 
+  # Early stopping: stop if a validation metric does not improve for N validation steps.
+  # Disabled unless early_stop_metric is set and early_stop_patience > 0.
+  early_stop_metric: null
+  early_stop_patience: 0
+  # Optional: "max" or "min". Defaults to best_ckpt_mode or "max" if unset.
+  early_stop_mode: null
+
   # Number of iterations to warm up the critic before updating policy
   critic_warmup: 0
 

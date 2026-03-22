@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # -------- Config --------
-REPO_DIR="/workspace/Qwen"
+REPO_DIR="/local/home/tommaben/workspace"
 REPO_URL="https://github.com/QwenLM/Qwen.git"
 MODEL_ID="Qwen/Qwen2.5-3B-Instruct"
 OUT_FILE="gsm8k_qwen25_3b_instruct_zeroshot.jsonl"
 
 # -------- Prep --------
-mkdir -p /workspace logs
+mkdir -p workspace logs
 
 if [[ -d "${REPO_DIR}/.git" ]]; then
   echo "[INFO] Repo already exists at ${REPO_DIR}, updating..."
@@ -90,7 +90,7 @@ def _patch_model_from_pretrained():
     _AutoModelForCausalLM.from_pretrained = wrapped
 
 
-def main():
+def main():`
     _patch_tokenizer_from_pretrained()
     _patch_model_from_pretrained()
 

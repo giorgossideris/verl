@@ -129,6 +129,7 @@ def _normalize_aliases(values: Optional[List[str]]) -> List[str]:
 
 def main() -> None:
     args = parse_args()
+    os.environ.setdefault("WANDB_DISABLE_SERVICE", "true")
 
     api_key = os.getenv(args.api_key_env)
     if not api_key:
