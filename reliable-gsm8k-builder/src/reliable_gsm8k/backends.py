@@ -90,6 +90,7 @@ def describe_model_config(config: dict[str, Any]) -> dict[str, Any]:
         "device_map": config.get("device_map"),
         "torch_dtype": config.get("torch_dtype"),
         "attn_implementation": config.get("attn_implementation"),
+        "padding_side": config.get("padding_side"),
     }
 
 
@@ -245,6 +246,7 @@ class TransformersCausalLMBackend:
     trust_remote_code: bool = False
     local_files_only: bool = False
     tokenizer_use_fast: bool = True
+    padding_side: str | None = None
     device: str | None = None
     device_map: str | None = "auto"
     torch_dtype: str | None = "auto"
@@ -271,6 +273,7 @@ class TransformersCausalLMBackend:
             self.trust_remote_code,
             self.local_files_only,
             self.tokenizer_use_fast,
+            self.padding_side,
             self.device,
             self.device_map,
             self.torch_dtype,
@@ -297,6 +300,8 @@ class TransformersCausalLMBackend:
             local_files_only=self.local_files_only,
             use_fast=self.tokenizer_use_fast,
         )
+        if self.padding_side is not None:
+            tokenizer.padding_side = self.padding_side
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -339,6 +344,7 @@ class TransformersCausalLMBackend:
             "device_map": self.device_map,
             "torch_dtype": self.torch_dtype,
             "attn_implementation": self.attn_implementation,
+            "padding_side": getattr(self._tokenizer if hasattr(self, "_tokenizer") else tokenizer, "padding_side", None),
             "loaded_attn_implementation": loaded_attn,
         }
         cached = (tokenizer, model, input_device, runtime_info)
@@ -446,6 +452,7 @@ def create_generation_backend(config: dict[str, Any]) -> TextGenerationBackend:
             trust_remote_code=bool(config.get("trust_remote_code", False)),
             local_files_only=bool(config.get("local_files_only", False)),
             tokenizer_use_fast=bool(config.get("tokenizer_use_fast", True)),
+            padding_side=config.get("padding_side"),
             device=config.get("device"),
             device_map=config.get("device_map", "auto"),
             torch_dtype=config.get("torch_dtype", "auto"),

@@ -61,7 +61,14 @@ python evals/oe_mc_eval_05_02_26/evaluate_base_qwen_dual_parse.py \
 
 - `--num_samples X` (or env `NUM_SAMPLES=X`)
   - If `X > 0`: evaluate only the first `X` instances from each split.
-  - If `X = 0`: evaluate on the full split (default).
+  - If omitted: evaluate on the full split (default).
+  - `X` must be positive when provided/set.
+- `--inference_id <id>`
+  - Use a named decoding/profile config instead of manual decoding flags.
+  - Available: `greedy`, `sample_balanced`, `sample_creative`, `greedy_different_system_prompt_test`, `greedy_bad_math_system_prompt_test`.
+  - Cannot be combined with manual decoding flags:
+    `--max_new_tokens`, `--max_length`, `--do_sample`, `--temperature`, `--top_p`,
+    `--repetition_penalty`, `--no_chat_template`, `--system_prompt`.
 - Multi-GPU behavior
   - The eval scripts support `torchrun` data-parallel evaluation (`WORLD_SIZE > 1`).
   - Each rank processes a shard of prompts, and rank 0 gathers/merges outputs before scoring + writing JSON.

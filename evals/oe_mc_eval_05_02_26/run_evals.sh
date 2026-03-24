@@ -21,6 +21,7 @@ set -euo pipefail
 #
 # Optional:
 #   export NUM_SAMPLES=200
+#   unset NUM_SAMPLES                       # full split (default)
 #   export PROMPT_STYLE="train"                 # or "raw"
 #   export NO_CHAT_TEMPLATE=0                   # 1 disables chat template
 #   export NO_COT_PHRASE=0                      # 1 removes "Let's think step by step" in train prompts
@@ -54,7 +55,6 @@ export WANDB_PROJECT="gsm8k-evaluation"
 export WANDB_ENTITY="tommaso-bendinelli-eth-zurich"
 export USE_FLASH_ATTN=1
 export ATTN_IMPL="flash_attention_2"
-export NUM_SAMPLES=0
 
 export WANDB_SILENT="${WANDB_SILENT:-true}"
 export WANDB__SERVICE_WAIT="${WANDB__SERVICE_WAIT:-300}"
@@ -68,7 +68,7 @@ OE_MODEL="${OE_MODEL:-}"
 MC_MODEL="${MC_MODEL:-}"
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-3B-Instruct}"
 
-NUM_SAMPLES="${NUM_SAMPLES:-0}"
+NUM_SAMPLES="${NUM_SAMPLES:-}"
 PROMPT_STYLE="${PROMPT_STYLE:-train}"
 NO_CHAT_TEMPLATE="${NO_CHAT_TEMPLATE:-0}"
 NO_COT_PHRASE="${NO_COT_PHRASE:-0}"
@@ -186,7 +186,6 @@ OUT_DIR="$REPO_ROOT/evals/oe_mc_eval_05_02_26/outputs/$RUN_TAG"
 mkdir -p "$OUT_DIR"
 
 COMMON_ARGS=(
-  --num_samples "$NUM_SAMPLES"
   --prompt_style "$PROMPT_STYLE"
   --batch_size "$BATCH_SIZE"
   --max_new_tokens "$MAX_NEW_TOKENS"
@@ -196,6 +195,14 @@ COMMON_ARGS=(
   --wandb_entity "$WANDB_ENTITY"
   --wandb_mode "$WANDB_MODE"
 )
+
+if [[ -n "$NUM_SAMPLES" ]]; then
+  if [[ ! "$NUM_SAMPLES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] NUM_SAMPLES must be a positive integer when set. Unset it for full split."
+    exit 1
+  fi
+  COMMON_ARGS+=(--num_samples "$NUM_SAMPLES")
+fi
 
 if [[ -n "$WANDB_RUN_GROUP" ]]; then
   COMMON_ARGS+=(--wandb_group "$WANDB_RUN_GROUP")

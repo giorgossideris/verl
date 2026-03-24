@@ -13,6 +13,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
+from tqdm import tqdm
 
 # Ensure repo-root imports regardless of CWD (so `import verl` works).
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -29,7 +30,8 @@ if str(BUILDER_SRC) not in sys.path:
 
 from verl.utils.reward_score import gsm8k as verl_gsm8k
 from verl.utils.reward_score import gsm8k_mc as verl_gsm8k_mc
-from reliable_gsm8k.profiles import INFERENCE_PROFILES, get_inference_profile
+from reliable_gsm8k.backends import create_generation_backend, get_backend_runtime_metadata
+from reliable_gsm8k.profiles import INFERENCE_PROFILES, MODEL_PROFILES, get_generator_profile, get_inference_profile
 
 
 # -----------------------------------------------------------------------------
@@ -263,6 +265,7 @@ def score_gsm8k_mc_with_verl(*, completion: str, ground_truth_letter: str, metho
 class GenerationConfig:
     max_new_tokens: int = 512
     max_length: int = 2048
+    number_of_samples: int = 1
     do_sample: bool = False
     temperature: float = 1.0
     top_p: float = 1.0
@@ -285,6 +288,17 @@ INFERENCE_OVERRIDE_FLAGS: Tuple[str, ...] = (
 
 def list_eval_inference_ids() -> List[str]:
     return sorted(INFERENCE_PROFILES.keys())
+
+
+def list_eval_model_ids() -> List[str]:
+    return sorted(MODEL_PROFILES.keys())
+
+
+def resolve_eval_model_profile(name: str) -> Dict[str, Any]:
+    if name not in MODEL_PROFILES:
+        known = ", ".join(list_eval_model_ids())
+        raise ValueError(f"Unknown --model_id '{name}'. Available: {known}")
+    return get_generator_profile(name)
 
 
 def resolve_eval_inference_profile(name: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -315,6 +329,186 @@ def validate_inference_id_args(*, inference_id: Optional[str], explicit_decoding
         return
     joined = ", ".join(explicit_decoding_flags)
     raise ValueError(f"--inference_id cannot be combined with manual decoding flags: {joined}")
+
+
+def _backend_prefers_local_transformers(config: Dict[str, Any]) -> bool:
+    return str(config.get("backend")) == "transformers_causal_lm"
+
+
+def _runtime_profile_for_dist(config: Dict[str, Any], dist_ctx: DistContext) -> Dict[str, Any]:
+    runtime_config = dict(config)
+    if _backend_prefers_local_transformers(runtime_config) and dist_ctx.enabled:
+        runtime_config["device_map"] = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                runtime_config["device"] = f"cuda:{dist_ctx.local_rank}"
+            else:
+                runtime_config["device"] = "cpu"
+        except Exception:
+            runtime_config["device"] = "cpu"
+    return runtime_config
+
+
+def create_generation_backend_for_eval(
+    *,
+    model_id: str,
+    dist_ctx: DistContext,
+) -> Tuple[Any, Dict[str, Any], Dict[str, Any]]:
+    resolved_profile = resolve_eval_model_profile(model_id)
+    runtime_profile = _runtime_profile_for_dist(resolved_profile, dist_ctx)
+    backend = create_generation_backend(runtime_profile)
+    runtime_info = get_backend_runtime_metadata(backend, runtime_profile)
+    return backend, resolved_profile, runtime_info
+
+
+def generation_sampling_from_config(gen_cfg: GenerationConfig) -> Dict[str, Any]:
+    sampling: Dict[str, Any] = {
+        "max_tokens": int(gen_cfg.max_new_tokens),
+        "max_length": int(gen_cfg.max_length),
+        "do_sample": bool(gen_cfg.do_sample),
+        "use_chat_template": bool(gen_cfg.use_chat_template),
+        "system_prompt": str(gen_cfg.system_prompt),
+        "n": int(gen_cfg.number_of_samples),
+    }
+    repetition_penalty = float(gen_cfg.repetition_penalty)
+    if repetition_penalty > 0:
+        sampling["repetition_penalty"] = repetition_penalty
+    if gen_cfg.do_sample:
+        sampling["temperature"] = float(gen_cfg.temperature)
+        sampling["top_p"] = float(gen_cfg.top_p)
+    return sampling
+
+
+def generate_batched_multi(
+    *,
+    model,
+    tokenizer,
+    prompts: Sequence[str],
+    gen_cfg: GenerationConfig,
+    batch_size: int,
+    progress_desc: Optional[str] = None,
+    progress_position: Optional[int] = None,
+) -> List[List[str]]:
+    import torch
+
+    formatted = _format_for_generation(
+        tokenizer=tokenizer,
+        prompts=prompts,
+        use_chat_template=gen_cfg.use_chat_template,
+        system_prompt=gen_cfg.system_prompt,
+    )
+
+    results: List[List[str]] = [[] for _ in formatted]
+    num_batches = math.ceil(len(formatted) / batch_size) if formatted else 0
+    progress = tqdm(
+        total=int(gen_cfg.number_of_samples) * num_batches,
+        desc=progress_desc,
+        position=progress_position,
+        leave=True,
+        dynamic_ncols=True,
+        disable=progress_desc is None or num_batches == 0,
+    )
+    for sample_index in range(int(gen_cfg.number_of_samples)):
+        sample_results: List[str] = []
+        for batch_index, start in enumerate(range(0, len(formatted), batch_size), start=1):
+            batch = formatted[start : start + batch_size]
+            inputs = tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=int(gen_cfg.max_length),
+            )
+            input_device = _get_input_device(model)
+            inputs = {k: v.to(input_device) for k, v in inputs.items()}
+
+            gen_kwargs: Dict[str, Any] = dict(
+                max_new_tokens=int(gen_cfg.max_new_tokens),
+                do_sample=bool(gen_cfg.do_sample),
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                repetition_penalty=float(gen_cfg.repetition_penalty),
+            )
+            if gen_cfg.do_sample:
+                gen_kwargs.update(
+                    temperature=float(gen_cfg.temperature),
+                    top_p=float(gen_cfg.top_p),
+                )
+
+            with torch.inference_mode():
+                outputs = model.generate(**inputs, **gen_kwargs)
+
+            prompt_len = inputs["input_ids"].shape[1]
+            gen_ids = outputs[:, prompt_len:]
+            texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            sample_results.extend([t.strip() for t in texts])
+            progress.set_postfix(sample=f"{sample_index + 1}/{int(gen_cfg.number_of_samples)}", batch=f"{batch_index}/{num_batches}")
+            progress.update(1)
+
+        for prompt_idx, text in enumerate(sample_results):
+            results[prompt_idx].append(text)
+    progress.close()
+    return results
+
+
+def generate_batched_with_backend_multi(
+    *,
+    backend,
+    prompts: Sequence[str],
+    gen_cfg: GenerationConfig,
+    batch_size: int,
+    progress_desc: Optional[str] = None,
+    progress_position: Optional[int] = None,
+) -> List[List[str]]:
+    model = getattr(backend, "_model", None)
+    tokenizer = getattr(backend, "_tokenizer", None)
+    if model is not None and tokenizer is not None:
+        return generate_batched_multi(
+            model=model,
+            tokenizer=tokenizer,
+            prompts=prompts,
+            gen_cfg=gen_cfg,
+            batch_size=batch_size,
+            progress_desc=progress_desc,
+            progress_position=progress_position,
+        )
+
+    del batch_size
+    sampling = generation_sampling_from_config(gen_cfg)
+    results: List[List[str]] = []
+    progress = tqdm(
+        total=len(prompts),
+        desc=progress_desc,
+        position=progress_position,
+        leave=True,
+        dynamic_ncols=True,
+        disable=progress_desc is None or not prompts,
+    )
+    for idx, prompt in enumerate(prompts):
+        responses = backend.generate(prompt=prompt, sampling=sampling, metadata={"prompt_index": idx})
+        if not responses:
+            raise RuntimeError("Generation backend returned no responses for prompt.")
+        results.append([(response.text or "").strip() for response in responses])
+        progress.update(1)
+    progress.close()
+    return results
+
+
+def generate_batched_with_backend(
+    *,
+    backend,
+    prompts: Sequence[str],
+    gen_cfg: GenerationConfig,
+    batch_size: int,
+) -> List[str]:
+    return [sample_texts[0] if sample_texts else "" for sample_texts in generate_batched_with_backend_multi(
+        backend=backend,
+        prompts=prompts,
+        gen_cfg=gen_cfg,
+        batch_size=batch_size,
+    )]
 
 
 def _get_input_device(model) -> "Any":
@@ -492,58 +686,20 @@ def generate_batched(
     gen_cfg: GenerationConfig,
     batch_size: int,
 ) -> List[str]:
-    import torch
-
-    formatted = _format_for_generation(
+    return [sample_texts[0] if sample_texts else "" for sample_texts in generate_batched_multi(
+        model=model,
         tokenizer=tokenizer,
         prompts=prompts,
-        use_chat_template=gen_cfg.use_chat_template,
-        system_prompt=gen_cfg.system_prompt,
-    )
-
-    results: List[str] = []
-    for start in range(0, len(formatted), batch_size):
-        batch = formatted[start : start + batch_size]
-        inputs = tokenizer(
-            batch,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=int(gen_cfg.max_length),
-        )
-        input_device = _get_input_device(model)
-        inputs = {k: v.to(input_device) for k, v in inputs.items()}
-
-        gen_kwargs: Dict[str, Any] = dict(
-            max_new_tokens=int(gen_cfg.max_new_tokens),
-            do_sample=bool(gen_cfg.do_sample),
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            repetition_penalty=float(gen_cfg.repetition_penalty),
-        )
-        if gen_cfg.do_sample:
-            gen_kwargs.update(
-                temperature=float(gen_cfg.temperature),
-                top_p=float(gen_cfg.top_p),
-            )
-
-        with torch.inference_mode():
-            outputs = model.generate(**inputs, **gen_kwargs)
-
-        # outputs include padded prompt; slicing by padded length yields pure generation.
-        prompt_len = inputs["input_ids"].shape[1]
-        gen_ids = outputs[:, prompt_len:]
-        texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-        results.extend([t.strip() for t in texts])
-
-    return results
+        gen_cfg=gen_cfg,
+        batch_size=batch_size,
+    )]
 
 
 def now_compact() -> str:
     return time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
 
-def write_json(path: str, payload: Dict[str, Any]) -> None:
+def write_json(path: str, payload: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)

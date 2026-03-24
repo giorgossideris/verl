@@ -29,9 +29,12 @@ from eval_utils import (
     build_gsm8k_mc_prompt,
     build_gsm8k_prompt,
     cleanup_distributed_if_needed,
+    create_generation_backend_for_eval,
     generate_batched,
+    generate_batched_with_backend,
     get_dist_context,
     init_distributed_if_needed,
+    list_eval_model_ids,
     load_model_and_tokenizer,
     now_compact,
     qwen_is_correct_choice,
@@ -48,6 +51,9 @@ from eval_utils import (
 )
 
 from verl.utils.reward_score import gsm8k as verl_gsm8k
+
+
+MODEL_OVERRIDE_FLAGS = ("--torch_dtype", "--attn_implementation")
 
 
 def _subset(dataset, num_samples: Optional[int]):
@@ -69,13 +75,13 @@ def _print_run_summary(run: Dict[str, Any]) -> None:
             print(f"  {k}: acc={v['accuracy']:.2%}{extra} ({v['correct']}/{v['total']})")
 
 
-def _free_model(model, tokenizer=None) -> None:
+def _free_runtime(*, backend=None, model=None, tokenizer=None) -> None:
     try:
         import torch
 
+        del backend
         del model
-        if tokenizer is not None:
-            del tokenizer
+        del tokenizer
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -83,6 +89,33 @@ def _free_model(model, tokenizer=None) -> None:
             torch.cuda.ipc_collect()
     except Exception:
         pass
+
+
+def _generate_responses(
+    *,
+    prompts,
+    gen_cfg: GenerationConfig,
+    batch_size: int,
+    backend=None,
+    model=None,
+    tokenizer=None,
+) -> List[str]:
+    if backend is not None:
+        return generate_batched_with_backend(
+            backend=backend,
+            prompts=prompts,
+            gen_cfg=gen_cfg,
+            batch_size=batch_size,
+        )
+    if model is None or tokenizer is None:
+        raise ValueError("Expected either a backend or a model/tokenizer pair for generation.")
+    return generate_batched(
+        model=model,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        gen_cfg=gen_cfg,
+        batch_size=batch_size,
+    )
 
 
 def _compute_gsm8k_metrics(examples: List[Dict[str, Any]], parse_methods: List[ParseMethod]) -> Dict[str, Any]:
@@ -152,7 +185,8 @@ def _compute_gsm8k_mc_metrics(examples: List[Dict[str, Any]], parse_methods: Lis
 
 def evaluate_one_model(
     *,
-    model_name_or_path: str,
+    model: Optional[str],
+    model_id: Optional[str],
     gsm8k,
     gsm8k_mc,
     gen_cfg: GenerationConfig,
@@ -164,126 +198,170 @@ def evaluate_one_model(
     attn_implementation: Optional[str],
     wandb_mode: str,
     dist_ctx,
-) -> List[Dict[str, Any]]:
-    model, tok = load_model_and_tokenizer(
-        model_name_or_path,
-        torch_dtype=torch_dtype,
-        attn_implementation=attn_implementation,
-        wandb_mode=wandb_mode,
-        device_map=None if dist_ctx.enabled else "auto",
-        local_rank=dist_ctx.local_rank,
-    )
-
-    runs: List[Dict[str, Any]] = []
-
-    # GSM8K
-    prompts = []
-    metas = []
-    for idx, ex in enumerate(gsm8k):
-        q = ex["question"]
-        ans = ex["answer"]
-        gt = verl_gsm8k.extract_solution(ans, method="strict") or ""
-        prompt = build_gsm8k_prompt(question=q, prompt_style=prompt_style, include_cot_phrase=include_cot_phrase)
-        prompts.append(prompt)
-        metas.append({"index": idx, "question": q, "answer": ans, "ground_truth": gt, "prompt": prompt})
-
-    local_prompts = shard_for_rank(prompts, dist_ctx)
-    local_metas = shard_for_rank(metas, dist_ctx)
-    responses = generate_batched(model=model, tokenizer=tok, prompts=local_prompts, gen_cfg=gen_cfg, batch_size=batch_size)
-    local_examples = []
-    for resp, meta in zip(responses, local_metas):
-        gt = meta["ground_truth"]
-        scores: Dict[str, Any] = {}
-        for m in parse_methods:
-            s = score_gsm8k_with_verl(completion=resp, ground_truth=gt, method=m)
-            scores[f"verl_{m}"] = s
-        q = qwen_is_correct_number(completion=resp, answer=meta["answer"])
-        scores["qwen_original"] = q
-        local_examples.append({**meta, "response": resp, "scores": scores})
-
-    gathered = all_gather_objects(local_examples, dist_ctx)
-    if dist_ctx.rank == 0:
-        examples = []
-        for shard_examples in gathered:
-            examples.extend(shard_examples)
-        examples.sort(key=lambda ex: int(ex["index"]))
-        runs.append(
-            {
-                "model_label": "BASE",
-                "dataset": "gsm8k",
-                "split": "test",
-                "prompt_style": prompt_style,
-                "use_chat_template": gen_cfg.use_chat_template,
-                "metrics": _compute_gsm8k_metrics(examples, parse_methods),
-                "examples": examples,
-            }
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    backend = None
+    loaded_model = None
+    tokenizer = None
+    model_config: Dict[str, Any]
+    if model_id is not None:
+        backend, model_profile, model_runtime = create_generation_backend_for_eval(
+            model_id=model_id,
+            dist_ctx=dist_ctx,
         )
-
-    # GSM8K-MC
-    prompts = []
-    metas = []
-    for idx, ex in enumerate(gsm8k_mc):
-        q = ex.get("Question") or ex.get("question") or ""
-        gt = (ex.get("Answer") or ex.get("answer") or "").strip()
-        prompt = build_gsm8k_mc_prompt(
-            question=q,
-            example=dict(ex),
-            prompt_style=prompt_style,
-            include_cot_phrase=include_cot_phrase,
+        model_config = {
+            "model_source": "model_profile",
+            "model_id": model_id,
+            "model_profile": model_profile,
+            "model_runtime": model_runtime,
+        }
+    else:
+        loaded_model, tokenizer = load_model_and_tokenizer(
+            model or "",
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            wandb_mode=wandb_mode,
+            device_map=None if dist_ctx.enabled else "auto",
+            local_rank=dist_ctx.local_rank,
         )
-        prompts.append(prompt)
-        metas.append(
-            {
-                "index": idx,
-                "question": q,
-                "ground_truth": gt,
-                "prompt": prompt,
-                "choices": {k: ex.get(k) for k in ["A", "B", "C", "D"] if ex.get(k) not in (None, "")},
-            }
+        model_config = {
+            "model_source": "raw_model",
+            "model": model,
+            "torch_dtype": torch_dtype,
+            "attn_implementation": attn_implementation,
+        }
+
+    try:
+        runs: List[Dict[str, Any]] = []
+
+        # GSM8K
+        prompts = []
+        metas = []
+        for idx, ex in enumerate(gsm8k):
+            q = ex["question"]
+            ans = ex["answer"]
+            gt = verl_gsm8k.extract_solution(ans, method="strict") or ""
+            prompt = build_gsm8k_prompt(question=q, prompt_style=prompt_style, include_cot_phrase=include_cot_phrase)
+            prompts.append(prompt)
+            metas.append({"index": idx, "question": q, "answer": ans, "ground_truth": gt, "prompt": prompt})
+
+        local_prompts = shard_for_rank(prompts, dist_ctx)
+        local_metas = shard_for_rank(metas, dist_ctx)
+        responses = _generate_responses(
+            backend=backend,
+            model=loaded_model,
+            tokenizer=tokenizer,
+            prompts=local_prompts,
+            gen_cfg=gen_cfg,
+            batch_size=batch_size,
         )
+        local_examples = []
+        for resp, meta in zip(responses, local_metas):
+            gt = meta["ground_truth"]
+            scores: Dict[str, Any] = {}
+            for m in parse_methods:
+                s = score_gsm8k_with_verl(completion=resp, ground_truth=gt, method=m)
+                scores[f"verl_{m}"] = s
+            q = qwen_is_correct_number(completion=resp, answer=meta["answer"])
+            scores["qwen_original"] = q
+            local_examples.append({**meta, "response": resp, "scores": scores})
 
-    local_prompts = shard_for_rank(prompts, dist_ctx)
-    local_metas = shard_for_rank(metas, dist_ctx)
-    responses = generate_batched(model=model, tokenizer=tok, prompts=local_prompts, gen_cfg=gen_cfg, batch_size=batch_size)
-    local_examples = []
-    for resp, meta in zip(responses, local_metas):
-        gt = meta["ground_truth"]
-        scores: Dict[str, Any] = {}
-        for m in parse_methods:
-            s = score_gsm8k_mc_with_verl(completion=resp, ground_truth_letter=gt, method=m)
-            scores[f"verl_{m}"] = s
+        gathered = all_gather_objects(local_examples, dist_ctx)
+        if dist_ctx.rank == 0:
+            examples = []
+            for shard_examples in gathered:
+                examples.extend(shard_examples)
+            examples.sort(key=lambda ex: int(ex["index"]))
+            runs.append(
+                {
+                    "model_label": "BASE",
+                    "dataset": "gsm8k",
+                    "split": "test",
+                    "prompt_style": prompt_style,
+                    "use_chat_template": gen_cfg.use_chat_template,
+                    "metrics": _compute_gsm8k_metrics(examples, parse_methods),
+                    "examples": examples,
+                }
+            )
 
-        q = qwen_is_correct_choice(completion=resp, gold_letter=gt)
-        scores["qwen_original"] = q
-        local_examples.append({**meta, "response": resp, "scores": scores})
+        # GSM8K-MC
+        prompts = []
+        metas = []
+        for idx, ex in enumerate(gsm8k_mc):
+            q = ex.get("Question") or ex.get("question") or ""
+            gt = (ex.get("Answer") or ex.get("answer") or "").strip()
+            prompt = build_gsm8k_mc_prompt(
+                question=q,
+                example=dict(ex),
+                prompt_style=prompt_style,
+                include_cot_phrase=include_cot_phrase,
+            )
+            prompts.append(prompt)
+            metas.append(
+                {
+                    "index": idx,
+                    "question": q,
+                    "ground_truth": gt,
+                    "prompt": prompt,
+                    "choices": {k: ex.get(k) for k in ["A", "B", "C", "D"] if ex.get(k) not in (None, "")},
+                }
+            )
 
-    gathered = all_gather_objects(local_examples, dist_ctx)
-    if dist_ctx.rank == 0:
-        examples = []
-        for shard_examples in gathered:
-            examples.extend(shard_examples)
-        examples.sort(key=lambda ex: int(ex["index"]))
-        runs.append(
-            {
-                "model_label": "BASE",
-                "dataset": "gsm8k_mc",
-                "split": "test",
-                "prompt_style": prompt_style,
-                "use_chat_template": gen_cfg.use_chat_template,
-                "metrics": _compute_gsm8k_mc_metrics(examples, parse_methods),
-                "examples": examples,
-            }
+        local_prompts = shard_for_rank(prompts, dist_ctx)
+        local_metas = shard_for_rank(metas, dist_ctx)
+        responses = _generate_responses(
+            backend=backend,
+            model=loaded_model,
+            tokenizer=tokenizer,
+            prompts=local_prompts,
+            gen_cfg=gen_cfg,
+            batch_size=batch_size,
         )
+        local_examples = []
+        for resp, meta in zip(responses, local_metas):
+            gt = meta["ground_truth"]
+            scores: Dict[str, Any] = {}
+            for m in parse_methods:
+                s = score_gsm8k_mc_with_verl(completion=resp, ground_truth_letter=gt, method=m)
+                scores[f"verl_{m}"] = s
 
-    _free_model(model, tok)
-    barrier_if_needed(dist_ctx)
-    return runs
+            q = qwen_is_correct_choice(completion=resp, gold_letter=gt)
+            scores["qwen_original"] = q
+            local_examples.append({**meta, "response": resp, "scores": scores})
+
+        gathered = all_gather_objects(local_examples, dist_ctx)
+        if dist_ctx.rank == 0:
+            examples = []
+            for shard_examples in gathered:
+                examples.extend(shard_examples)
+            examples.sort(key=lambda ex: int(ex["index"]))
+            runs.append(
+                {
+                    "model_label": "BASE",
+                    "dataset": "gsm8k_mc",
+                    "split": "test",
+                    "prompt_style": prompt_style,
+                    "use_chat_template": gen_cfg.use_chat_template,
+                    "metrics": _compute_gsm8k_mc_metrics(examples, parse_methods),
+                    "examples": examples,
+                }
+            )
+    finally:
+        _free_runtime(backend=backend, model=loaded_model, tokenizer=tokenizer)
+        barrier_if_needed(dist_ctx)
+    return runs, model_config
 
 
 def main() -> None:
     explicit_decoding_flags = find_explicit_cli_flags(sys.argv[1:], INFERENCE_OVERRIDE_FLAGS)
-    parser = argparse.ArgumentParser(description="Eval a base/original Qwen model on GSM8K + GSM8K-MC with dual parsing.")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct", help="Model (local dir or HF repo id).")
+    explicit_model_override_flags = find_explicit_cli_flags(sys.argv[1:], MODEL_OVERRIDE_FLAGS)
+    parser = argparse.ArgumentParser(description="Eval a model or model profile on GSM8K + GSM8K-MC with dual parsing.")
+    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group.add_argument("--model", help="Model (local dir, HF repo id, or W&B artifact ref).")
+    model_group.add_argument(
+        "--model_id",
+        choices=list_eval_model_ids(),
+        help="Model profile id from reliable_gsm8k.profiles.MODEL_PROFILES.",
+    )
 
     parser.add_argument("--gsm8k_dataset", default="openai/gsm8k")
     parser.add_argument("--gsm8k_config", default="main")
@@ -318,13 +396,13 @@ def main() -> None:
         "--torch_dtype",
         choices=["float16", "bfloat16", "float32"],
         default="float16",
-        help="torch_dtype for model weights (must be supported by your GPU).",
+        help="torch_dtype for raw --model loading (must be supported by your GPU).",
     )
     parser.add_argument(
         "--attn_implementation",
         choices=["eager", "sdpa", "flash_attention_2"],
         default=None,
-        help="Optional attention backend (Transformers `attn_implementation`).",
+        help="Optional attention backend for raw --model loading.",
     )
 
     parser.add_argument("--prompt_style", choices=["train", "raw"], default="train")
@@ -356,6 +434,9 @@ def main() -> None:
         )
     except ValueError as e:
         parser.error(str(e))
+    if args.model_id is not None and explicit_model_override_flags:
+        joined = ", ".join(explicit_model_override_flags)
+        parser.error(f"--model_id cannot be combined with manual model-loading flags: {joined}")
 
     dist_ctx = get_dist_context()
     init_distributed_if_needed(dist_ctx)
@@ -394,8 +475,9 @@ def main() -> None:
         parse_methods: List[ParseMethod] = [m for m in args.parse_methods]  # type: ignore[assignment]
         include_cot_phrase = not args.no_cot_phrase
 
-        runs = evaluate_one_model(
-            model_name_or_path=args.model,
+        runs, model_config = evaluate_one_model(
+            model=args.model,
+            model_id=args.model_id,
             gsm8k=gsm8k,
             gsm8k_mc=gsm8k_mc,
             gen_cfg=gen_cfg,
@@ -415,8 +497,9 @@ def main() -> None:
         out_json = args.out_json or f"evals/oe_mc_eval_05_02_26/base_qwen_dual_parse_{now_compact()}.json"
         payload: Dict[str, Any] = {
             "config": {
-                "model": args.model,
+                **model_config,
                 "gsm8k_dataset": args.gsm8k_dataset,
+                "gsm8k_config": args.gsm8k_config,
                 "gsm8k_split": args.gsm8k_split,
                 "mc_dataset": args.mc_dataset,
                 "mc_split": args.mc_split,
