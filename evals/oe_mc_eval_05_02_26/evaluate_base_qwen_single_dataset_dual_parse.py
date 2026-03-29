@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -138,6 +139,16 @@ def _resolve_model_path(model_config: Dict[str, Any]) -> Optional[str]:
     )
 
 
+def _build_question_id(*, dataset_name: str, example: Dict[str, Any]) -> Any:
+    if dataset_name != "gsm8k":
+        return example.get("index")
+
+    question = example.get("question")
+    if not isinstance(question, str) or not question:
+        raise ValueError("GSM8K answer records require a non-empty 'question' field to derive question_id.")
+    return hashlib.md5(question.encode("utf-8")).hexdigest()
+
+
 def _build_answer_records(*, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     config = payload["config"]
     model_config = {
@@ -158,7 +169,7 @@ def _build_answer_records(*, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             answer_records.append(
                 {
                     "identity": {
-                        "question_id": example.get("index"),
+                        "question_id": _build_question_id(dataset_name=dataset_name, example=example),
                         "dataset_name": dataset_name,
                         "split": split,
                         "inference_id": inference_id,
@@ -183,7 +194,7 @@ def _build_answer_record(
 ) -> Dict[str, Any]:
     return {
         "identity": {
-            "question_id": example.get("index"),
+            "question_id": _build_question_id(dataset_name=dataset_name, example=example),
             "dataset_name": dataset_name,
             "split": split,
             "inference_id": inference_id,
@@ -194,6 +205,13 @@ def _build_answer_record(
             "responses": list(example.get("responses") or [example["response"]]),
         },
     }
+
+
+def _question_id_sort_key(question_id: Any):
+    text = str(question_id or "")
+    if text.isdigit():
+        return (0, int(text))
+    return (1, text)
 
 
 def _merge_answer_shards(*, shard_paths: List[str], answer_out_json: str) -> None:
@@ -208,7 +226,7 @@ def _merge_answer_shards(*, shard_paths: List[str], answer_out_json: str) -> Non
         key=lambda record: (
             str(record["identity"].get("dataset_name") or ""),
             str(record["identity"].get("split") or ""),
-            int(record["identity"].get("question_id") or 0),
+            _question_id_sort_key(record["identity"].get("question_id")),
         )
     )
     write_json(answer_out_json, merged_records)
@@ -382,6 +400,7 @@ def _compute_gsm8k_mc_metrics(examples: List[Dict[str, Any]], parse_methods: Lis
 def _evaluate_gsm8k(
     *,
     dataset,
+    dataset_split: str,
     gen_cfg: GenerationConfig,
     batch_size: int,
     prompt_style: str,
@@ -461,7 +480,7 @@ def _evaluate_gsm8k(
                 _build_answer_record(
                     example=local_examples[-1],
                     dataset_name="gsm8k",
-                    split="test",
+                    split=dataset_split,
                     inference_id=inference_id,
                     model_config=model_config,
                 )
@@ -480,7 +499,7 @@ def _evaluate_gsm8k(
     return {
         "model_label": "BASE",
         "dataset": "gsm8k",
-        "split": "test",
+        "split": dataset_split,
         "prompt_style": prompt_style,
         "use_chat_template": gen_cfg.use_chat_template,
         "metrics": _compute_gsm8k_metrics(examples, parse_methods),
@@ -491,6 +510,7 @@ def _evaluate_gsm8k(
 def _evaluate_gsm8k_mc(
     *,
     dataset,
+    dataset_split: str,
     gen_cfg: GenerationConfig,
     batch_size: int,
     prompt_style: str,
@@ -585,7 +605,7 @@ def _evaluate_gsm8k_mc(
                 _build_answer_record(
                     example=local_examples[-1],
                     dataset_name="gsm8k_mc",
-                    split="test",
+                    split=dataset_split,
                     inference_id=inference_id,
                     model_config=model_config,
                 )
@@ -604,7 +624,7 @@ def _evaluate_gsm8k_mc(
     return {
         "model_label": "BASE",
         "dataset": "gsm8k_mc",
-        "split": "test",
+        "split": dataset_split,
         "prompt_style": prompt_style,
         "use_chat_template": gen_cfg.use_chat_template,
         "metrics": _compute_gsm8k_mc_metrics(examples, parse_methods),
@@ -618,6 +638,7 @@ def evaluate_one_model(
     model_id: Optional[str],
     dataset_kind: DatasetKind,
     dataset,
+    dataset_split: str,
     gen_cfg: GenerationConfig,
     batch_size: int,
     prompt_style: str,
@@ -666,6 +687,7 @@ def evaluate_one_model(
             if dataset_kind == "gsm8k":
                 run = _evaluate_gsm8k(
                     dataset=dataset,
+                    dataset_split=dataset_split,
                     gen_cfg=gen_cfg,
                     batch_size=batch_size,
                     prompt_style=prompt_style,
@@ -682,6 +704,7 @@ def evaluate_one_model(
             else:
                 run = _evaluate_gsm8k_mc(
                     dataset=dataset,
+                    dataset_split=dataset_split,
                     gen_cfg=gen_cfg,
                     batch_size=batch_size,
                     prompt_style=prompt_style,
@@ -854,6 +877,7 @@ def main() -> None:
             model_id=args.model_id,
             dataset_kind=dataset_kind,
             dataset=dataset,
+            dataset_split=args.gsm8k_split if dataset_kind == "gsm8k" else args.mc_split,
             gen_cfg=gen_cfg,
             batch_size=args.batch_size,
             prompt_style=args.prompt_style,

@@ -42,7 +42,7 @@ def _parse_splits(raw: str) -> List[str]:
 def _default_output_dir(dataset_name: str, config_name: str | None) -> str:
     dataset_tag = _sanitize_name(dataset_name)
     config_tag = _sanitize_name(config_name) if config_name else "default"
-    return os.path.expanduser(f"~/data/{dataset_tag}_{config_tag}_with_question_id")
+    return os.path.expanduser(f"~/data/primitive/{dataset_tag}_{config_tag}_with_question_id")
 
 
 def _load_dataset_dict(local_dataset_path: str | None, dataset_name: str, config_name: str | None):

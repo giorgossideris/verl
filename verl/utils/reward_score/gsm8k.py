@@ -17,6 +17,14 @@ import re
 _SOLUTION_CLIP_CHARS = 300
 
 
+def _normalize_numeric_token(token):
+    token = token.replace(",", "").replace("$", "")
+    # Flexible extraction can pick up sentence-ending punctuation like "308.".
+    # Strip only trailing punctuation after a digit while keeping real decimals intact.
+    token = re.sub(r"(?<=\d)[\.,]+$", "", token)
+    return token
+
+
 def extract_solution(solution_str, method="strict"):
     assert method in ["strict", "flexible"]
 
@@ -33,7 +41,7 @@ def extract_solution(solution_str, method="strict"):
             final_answer = None
         else:
             # take the last solution
-            final_answer = solutions[-1].replace(",", "").replace("$", "")
+            final_answer = _normalize_numeric_token(solutions[-1])
     elif method == "flexible":
         answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
         final_answer = None
@@ -45,6 +53,7 @@ def extract_solution(solution_str, method="strict"):
             # find the last number that is not '.'
             for final_answer in reversed(answer):
                 if final_answer not in invalid_str:
+                    final_answer = _normalize_numeric_token(final_answer)
                     break
     return final_answer
 

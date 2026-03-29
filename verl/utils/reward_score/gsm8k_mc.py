@@ -19,9 +19,9 @@ import re
 _SOLUTION_CLIP_CHARS = 300
 
 
-# We enforce the model to output the choice letter after '####'
-# e.g., '...is 42. #### C'
-# The final answer must be a single uppercase letter A, B, C, or D.
+# We enforce the model to output the choice marker after '####'
+# e.g., '...is 42. #### C' or '... #### NONE'
+# The final answer may be a single uppercase letter or NONE.
 
 
 def extract_choice(solution_str, method="strict"):
@@ -29,9 +29,9 @@ def extract_choice(solution_str, method="strict"):
     Extracts the final multiple-choice letter from the model's output.
 
     strict:
-        requires format: #### C
+        requires format: #### C or #### NONE
     flexible:
-        recovers the last valid A-D near the end, even if formatting is sloppy
+        recovers the last valid option token near the end, even if formatting is sloppy
     """
     assert method in ["strict", "flexible"]
 
@@ -39,18 +39,15 @@ def extract_choice(solution_str, method="strict"):
         solution_str = solution_str[-_SOLUTION_CLIP_CHARS:]
 
     if method == "strict":
-        # Same behavior as today
-        match = re.search(r"####\s*([A-D])", solution_str)
+        match = re.search(r"####\s*(NONE|[A-Z])\b", solution_str)
         if match:
             return match.group(1)
         return None
 
     elif method == "flexible":
-        # Find all standalone A-D letters (word boundaries)
-        candidates = re.findall(r"\b([A-D])\b", solution_str)
+        candidates = re.findall(r"\b(NONE|[A-Z])\b", solution_str)
         if not candidates:
             return None
-        # Take the last valid choice
         return candidates[-1]
 
 

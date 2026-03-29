@@ -17,6 +17,16 @@ MODEL_PROFILES: dict[str, dict] = {
         "attn_implementation": None,
         "enforce_attn_implementation": True,
     },
+    "qwen25_3b_sglang": {
+        "backend": "sglang",
+        "model_name": "Qwen/Qwen2.5-3B-Instruct",
+        "api_base": "http://127.0.0.1:30000/v1",
+        "api_key": "EMPTY",
+        "timeout_seconds": 120,
+        "max_retries": 8,
+        "retry_base_seconds": 1.0,
+        "retry_max_seconds": 30.0,
+    },
     "gpt4o_mini": {
         "backend": "openai_compatible",
         "model_name": "gpt-4o-mini",

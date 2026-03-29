@@ -233,7 +233,111 @@ class OpenAICompatibleBackend:
             outputs.append(
                 GenerationResponse(
                     text=message.get("content", ""),
-                    raw_response={"choice_index": index, "choice": choice, "metadata": metadata or {}},
+                    raw_response={
+                        "backend": "openai_compatible",
+                        "choice_index": index,
+                        "choice": choice,
+                        "metadata": metadata or {},
+                    },
+                )
+            )
+        return outputs
+
+
+@dataclass
+class SGLangBackend:
+    model_name: str
+    api_base: str
+    api_key: str | None = None
+    timeout_seconds: int = 120
+    max_retries: int = 8
+    retry_base_seconds: float = 1.0
+    retry_max_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        self.runtime_info = {
+            "backend": "sglang",
+            "model_name": self.model_name,
+            "api_base": self.api_base,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+    def generate(self, *, prompt: str, sampling: dict[str, Any], metadata: dict[str, Any] | None = None) -> list[GenerationResponse]:
+        temperature = float(sampling.get("temperature", 0.0))
+        top_p = float(sampling.get("top_p", 1.0))
+        do_sample = sampling.get("do_sample")
+        use_chat_template = bool(sampling.get("use_chat_template", True))
+        system_prompt = sampling.get("system_prompt", "You are a helpful assistant.")
+        if do_sample is None:
+            do_sample = temperature > 0.0 or top_p < 1.0
+        if not bool(do_sample):
+            temperature = 0.0
+            top_p = 1.0
+        payload = {
+            "model": self.model_name,
+            "messages": _build_chat_messages(
+                prompt=prompt,
+                use_chat_template=use_chat_template,
+                system_prompt=system_prompt,
+            ),
+            "temperature": temperature,
+            "max_tokens": sampling.get("max_tokens", 512),
+            "top_p": top_p,
+            "n": sampling.get("n", 1),
+            "seed": sampling.get("seed"),
+        }
+        endpoint = self.api_base.rstrip("/") + "/chat/completions"
+        body = json.dumps(payload).encode("utf-8")
+        decoded = None
+        for attempt_index in range(self.max_retries + 1):
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            request = urllib.request.Request(
+                endpoint,
+                data=body,
+                method="POST",
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    decoded = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                response_body = exc.read().decode("utf-8", errors="replace")
+                if exc.code in _RETRYABLE_HTTP_STATUS_CODES and attempt_index < self.max_retries:
+                    delay_seconds = _extract_retry_delay_seconds(
+                        response_body=response_body,
+                        headers=getattr(exc, "headers", None),
+                        attempt_index=attempt_index,
+                        retry_base_seconds=self.retry_base_seconds,
+                        retry_max_seconds=self.retry_max_seconds,
+                    )
+                    time.sleep(delay_seconds)
+                    continue
+                raise RuntimeError(
+                    f"SGLang generation request failed for model '{self.model_name}' at '{endpoint}' "
+                    f"with HTTP {exc.code}: {response_body}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    f"SGLang generation request failed for model '{self.model_name}' at '{endpoint}': {exc}. "
+                    "Verify the SGLang server is running and reachable."
+                ) from exc
+        if decoded is None:
+            raise RuntimeError("request retries exhausted without a decoded response")
+        outputs: list[GenerationResponse] = []
+        for index, choice in enumerate(decoded.get("choices", [])):
+            message = choice.get("message", {})
+            outputs.append(
+                GenerationResponse(
+                    text=message.get("content", ""),
+                    raw_response={
+                        "backend": "sglang",
+                        "choice_index": index,
+                        "choice": choice,
+                        "metadata": metadata or {},
+                    },
                 )
             )
         return outputs
@@ -440,6 +544,20 @@ def create_generation_backend(config: dict[str, Any]) -> TextGenerationBackend:
             model_name=config["model_name"],
             api_base=config["api_base"],
             api_key=api_key or "EMPTY",
+            timeout_seconds=int(config.get("timeout_seconds", 120)),
+            max_retries=int(config.get("max_retries", 8)),
+            retry_base_seconds=float(config.get("retry_base_seconds", 1.0)),
+            retry_max_seconds=float(config.get("retry_max_seconds", 30.0)),
+        )
+    if backend_type == "sglang":
+        api_base = config.get("api_base")
+        if not api_base:
+            raise ValueError("SGLang backend requires 'api_base' in the model profile.")
+        api_key = resolve_api_key_from_config(config)
+        return SGLangBackend(
+            model_name=config["model_name"],
+            api_base=str(api_base),
+            api_key=api_key,
             timeout_seconds=int(config.get("timeout_seconds", 120)),
             max_retries=int(config.get("max_retries", 8)),
             retry_base_seconds=float(config.get("retry_base_seconds", 1.0)),
